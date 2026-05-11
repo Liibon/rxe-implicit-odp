@@ -60,9 +60,12 @@ int main(void)
 	if (!ctx) return 77; /* skip code */
 
 	/* Cases ordered from cheapest to most pathological. */
+	/* "no access" is valid in the ABI as a read-only source lkey, so the
+	 * prototype accepts it. The interesting cases are local-write
+	 * (accept) and any remote bit (reject). */
 	const struct case_t cases[] = {
 		{ "implicit + local_write",   IBV_ACCESS_ON_DEMAND | IBV_ACCESS_LOCAL_WRITE,   1 },
-		{ "implicit + no access",     IBV_ACCESS_ON_DEMAND,                            0 },
+		{ "implicit + no access",     IBV_ACCESS_ON_DEMAND,                            1 },
 		{ "implicit + remote_write",  IBV_ACCESS_ON_DEMAND | IBV_ACCESS_REMOTE_WRITE,  0 },
 		{ "implicit + remote_read",   IBV_ACCESS_ON_DEMAND | IBV_ACCESS_REMOTE_READ,   0 },
 		{ "implicit + remote_atomic", IBV_ACCESS_ON_DEMAND | IBV_ACCESS_REMOTE_ATOMIC, 0 },
