@@ -1,37 +1,73 @@
-From 4227171aab1656d37f2964a80b00d8c7bb3b73ce Mon Sep 17 00:00:00 2001
+From 4d5f29dc36c39c5522c7f60279b564591bad2f4e Mon Sep 17 00:00:00 2001
 From: Liibaan Egal <liibaaneagle@gmail.com>
 Date: Mon, 11 May 2026 14:20:43 -0500
 Subject: [PATCH] RDMA/rxe: prototype local-access implicit ODP MR support
 
-RXE currently rejects the implicit ODP registration form (addr == 0,
+RXE rejects the implicit ODP registration form (addr == 0,
 length == U64_MAX, IB_ACCESS_ON_DEMAND) because it only sets up explicit
 ODP umems via ib_umem_odp_get(). The implicit branch was a placeholder
-with a Never reach here comment.
+with a Never reach here comment, and no path created child umems for
+SGE accesses on an implicit MR.
 
-Wire the implicit case through ib_umem_odp_alloc_implicit(), restricted
-to local access only. Remote access bits are rejected with EOPNOTSUPP at
-registration time: the child-umem on-demand creation path in the local
-SGE walker is sufficient to support local-access semantics, while a
-remote rkey on an implicit MR would expose arbitrary process VA to a
-peer without the protections that explicit ODP currently relies on.
+Wire the implicit registration case through ib_umem_odp_alloc_implicit()
+and route the local SGE walker through child umems.
+
+Registration. rxe_odp_mr_init_implicit() rejects remote access bits up
+front (-EOPNOTSUPP), allocates the empty parent umem via
+ib_umem_odp_alloc_implicit(), and skips rxe_odp_init_pages(): there are
+no pages to fault in at registration time. mr->odp_child is NULL until
+first access.
+
+SGE fault path. The existing rxe_odp_map_range_and_lock chokepoint is
+refactored to ask a new helper, rxe_odp_umem_for_iova(), which returns
+to_ib_umem_odp(mr->umem) for explicit MRs and rxe_odp_resolve_implicit()
+for implicit ones. The resolver caches a single child umem on mr; if
+the cached child does not cover the requested range it is released and
+a new one is allocated via ib_umem_odp_alloc_child(). All downstream
+helpers (__rxe_odp_mr_copy, rxe_odp_do_pagefault_and_lock) take the
+chosen umem_odp directly, so existing explicit behavior is unchanged
+and implicit walks see a real per-page interface.
+
+The prefetch path is routed through the same helper so an implicit MR
+can be prefetched.
+
+Atomic, flush, and atomic-write paths reject implicit MRs at the top of
+each helper. These walk mr->umem->pfn_list directly which is empty for
+an implicit parent; the prototype does not extend them, since the test
+matrix does not exercise them and rejecting keeps the public claim
+aligned with what is verified.
+
+Lifetime. rxe_mr_cleanup releases mr->odp_child before mr->umem so the
+child's mmu_interval_notifier tears down while the parent's per_mm is
+still alive.
 
 The general_caps advertisement is extended with IB_ODP_SUPPORT_IMPLICIT
-so userspace can detect the prototype support. Per-transport caps stay
-unchanged: those describe RC/UD behavior on explicit ODP MRs and remain
-accurate for that path.
+so userspace can probe support via ibv_query_device. Per-transport caps
+are unchanged: they describe RC/UD behavior on explicit ODP MRs and
+remain accurate for that path.
 
-This is a prototype, not an upstream submission. See CLAIMS.md in the
-companion rxe-implicit-odp repository for the scope boundary and the
-verbs tests that cover the registration accept/reject matrix.
+Limitations. The child cache is single-slot: a workload that touches
+disjoint ranges on the same implicit MR would thrash the cache. There
+is no explicit serialization around mr->odp_child; the prototype assumes
+SGE walks for a single MR are serialized at a higher level.
+
+Verified on Linux 6.17 (arm64, Soft-RoCE over loopback): all five
+registration matrix cases pass and a 64 KiB RDMA WRITE through an
+implicit local lkey is delivered end to end. See the companion
+rxe-implicit-odp repository for tests, bench, and measured results.
+
+This is a prototype, not an upstream submission.
 
 Signed-off-by: Liibaan Egal <liibaaneagle@gmail.com>
 ---
- drivers/infiniband/sw/rxe/rxe.c     |  7 +++-
- drivers/infiniband/sw/rxe/rxe_odp.c | 50 ++++++++++++++++++++++++++++-
- 2 files changed, 55 insertions(+), 2 deletions(-)
+ drivers/infiniband/sw/rxe/rxe.c       |   7 +-
+ drivers/infiniband/sw/rxe/rxe_mr.c    |   9 ++
+ drivers/infiniband/sw/rxe/rxe_odp.c   | 220 +++++++++++++++++++++-----
+ drivers/infiniband/sw/rxe/rxe_verbs.h |   9 ++
+ 4 files changed, 201 insertions(+), 44 deletions(-)
 
 diff --git a/drivers/infiniband/sw/rxe/rxe.c b/drivers/infiniband/sw/rxe/rxe.c
-index e891199cb..a8107a1ef 100644
+index e891199..a8107a1 100644
 --- a/drivers/infiniband/sw/rxe/rxe.c
 +++ b/drivers/infiniband/sw/rxe/rxe.c
 @@ -92,8 +92,13 @@ static void rxe_init_device_param(struct rxe_dev *rxe, struct net_device *ndev)
@@ -49,18 +85,84 @@ index e891199cb..a8107a1ef 100644
  
  		rxe->attr.odp_caps.per_transport_caps.ud_odp_caps |= IB_ODP_SUPPORT_SEND;
  		rxe->attr.odp_caps.per_transport_caps.ud_odp_caps |= IB_ODP_SUPPORT_RECV;
+diff --git a/drivers/infiniband/sw/rxe/rxe_mr.c b/drivers/infiniband/sw/rxe/rxe_mr.c
+index bcb97b3..7ff0439 100644
+--- a/drivers/infiniband/sw/rxe/rxe_mr.c
++++ b/drivers/infiniband/sw/rxe/rxe_mr.c
+@@ -6,6 +6,8 @@
+ 
+ #include <linux/libnvdimm.h>
+ 
++#include <rdma/ib_umem_odp.h>
++
+ #include "rxe.h"
+ #include "rxe_loc.h"
+ 
+@@ -723,6 +725,13 @@ void rxe_mr_cleanup(struct rxe_pool_elem *elem)
+ 	struct rxe_mr *mr = container_of(elem, typeof(*mr), elem);
+ 
+ 	rxe_put(mr_pd(mr));
++
++	/* Implicit ODP MRs may hold a child umem created lazily on first
++	 * access. I release it before the parent so its mmu_interval_notifier
++	 * is torn down while the parent's per_mm is still alive. */
++	if (mr->odp_child)
++		ib_umem_odp_release(mr->odp_child);
++
+ 	ib_umem_release(mr->umem);
+ 
+ 	if (mr->ibmr.type != IB_MR_TYPE_DMA)
 diff --git a/drivers/infiniband/sw/rxe/rxe_odp.c b/drivers/infiniband/sw/rxe/rxe_odp.c
-index f58e3ec62..039bff218 100644
+index f58e3ec..95407ba 100644
 --- a/drivers/infiniband/sw/rxe/rxe_odp.c
 +++ b/drivers/infiniband/sw/rxe/rxe_odp.c
-@@ -76,6 +76,54 @@ static int rxe_odp_init_pages(struct rxe_mr *mr)
+@@ -41,9 +41,14 @@ const struct mmu_interval_notifier_ops rxe_mn_ops = {
+ #define RXE_PAGEFAULT_DEFAULT 0
+ #define RXE_PAGEFAULT_RDONLY BIT(0)
+ #define RXE_PAGEFAULT_SNAPSHOT BIT(1)
+-static int rxe_odp_do_pagefault_and_lock(struct rxe_mr *mr, u64 user_va, int bcnt, u32 flags)
++
++/* Low-level fault helper. Operates directly on a umem_odp (parent for
++ * explicit MRs, child for implicit). Returns the number of pages mapped
++ * on success, negative on error. On success the caller holds
++ * umem_odp->umem_mutex via ib_umem_odp_map_dma_and_lock. */
++static int rxe_odp_do_pagefault_and_lock(struct ib_umem_odp *umem_odp,
++					 u64 user_va, int bcnt, u32 flags)
+ {
+-	struct ib_umem_odp *umem_odp = to_ib_umem_odp(mr->umem);
+ 	bool fault = !(flags & RXE_PAGEFAULT_SNAPSHOT);
+ 	u64 access_mask = 0;
+ 	int np;
+@@ -51,11 +56,6 @@ static int rxe_odp_do_pagefault_and_lock(struct rxe_mr *mr, u64 user_va, int bcn
+ 	if (umem_odp->umem.writable && !(flags & RXE_PAGEFAULT_RDONLY))
+ 		access_mask |= HMM_PFN_WRITE;
+ 
+-	/*
+-	 * ib_umem_odp_map_dma_and_lock() locks umem_mutex on success.
+-	 * Callers must release the lock later to let invalidation handler
+-	 * do its work again.
+-	 */
+ 	np = ib_umem_odp_map_dma_and_lock(umem_odp, user_va, bcnt,
+ 					  access_mask, fault);
+ 	return np;
+@@ -66,7 +66,8 @@ static int rxe_odp_init_pages(struct rxe_mr *mr)
+ 	struct ib_umem_odp *umem_odp = to_ib_umem_odp(mr->umem);
+ 	int ret;
+ 
+-	ret = rxe_odp_do_pagefault_and_lock(mr, mr->umem->address,
++	/* Explicit MR only: I snapshot the page table at registration. */
++	ret = rxe_odp_do_pagefault_and_lock(umem_odp, mr->umem->address,
+ 					    mr->umem->length,
+ 					    RXE_PAGEFAULT_SNAPSHOT);
+ 
+@@ -76,6 +77,49 @@ static int rxe_odp_init_pages(struct rxe_mr *mr)
  	return ret >= 0 ? 0 : ret;
  }
  
 +/* I keep the remote-access mask local to this file. The implicit form is
-+ * gated to local access only for this prototype: a remote rkey on an
-+ * implicit MR would let a peer fault arbitrary user pages, which the fault
-+ * path does not yet defend against. */
++ * gated to local access only for this prototype. Remote rkey use on an
++ * implicit MR would let a peer drive faults against arbitrary process VA,
++ * and that surface is intentionally not addressed here. */
 +#define RXE_REMOTE_ACCESS_MASK (IB_ACCESS_REMOTE_READ |	\
 +				IB_ACCESS_REMOTE_WRITE |	\
 +				IB_ACCESS_REMOTE_ATOMIC)
@@ -76,11 +178,9 @@ index f58e3ec62..039bff218 100644
 +	if (access_flags & RXE_REMOTE_ACCESS_MASK)
 +		return -EOPNOTSUPP;
 +
-+	/* For implicit MRs ib_umem_odp_alloc_implicit() builds the empty
-+	 * parent umem. No pages are pinned and no per-page list is allocated,
-+	 * which is the whole point of implicit registration: registration
-+	 * cost should not scale with region size. Child umems are created on
-+	 * demand at first access. */
++	/* ib_umem_odp_alloc_implicit() builds the empty parent umem. No
++	 * pages are pinned and no per-page list is allocated. Child umems
++	 * are created on demand at first access by rxe_odp_resolve_implicit. */
 +	umem_odp = ib_umem_odp_alloc_implicit(&rxe->ib_dev, access_flags);
 +	if (IS_ERR(umem_odp)) {
 +		rxe_dbg_mr(mr, "implicit umem alloc failed err=%d\n",
@@ -94,11 +194,8 @@ index f58e3ec62..039bff218 100644
 +	mr->ibmr.length = U64_MAX;
 +	mr->ibmr.iova = 0;
 +	mr->page_offset = 0;
++	mr->odp_child = NULL;
 +
-+	/* I skip rxe_odp_init_pages() here: there are no pages to fault in at
-+	 * registration time. The lkey is immediately valid for local SGE use.
-+	 * The fault path resolves pages lazily via ib_umem_odp_get() on a
-+	 * child range when a local access first touches it. */
 +	mr->state = RXE_MR_STATE_VALID;
 +	mr->ibmr.type = IB_MR_TYPE_USER;
 +
@@ -108,7 +205,7 @@ index f58e3ec62..039bff218 100644
  int rxe_odp_mr_init_user(struct rxe_dev *rxe, u64 start, u64 length,
  			 u64 iova, int access_flags, struct rxe_mr *mr)
  {
-@@ -93,7 +141,7 @@ int rxe_odp_mr_init_user(struct rxe_dev *rxe, u64 start, u64 length,
+@@ -93,7 +137,7 @@ int rxe_odp_mr_init_user(struct rxe_dev *rxe, u64 start, u64 length,
  		if (!(rxe->attr.odp_caps.general_caps & IB_ODP_SUPPORT_IMPLICIT))
  			return -EINVAL;
  
@@ -117,6 +214,336 @@ index f58e3ec62..039bff218 100644
  	}
  
  	umem_odp = ib_umem_odp_get(&rxe->ib_dev, start, length, access_flags,
+@@ -124,6 +168,57 @@ int rxe_odp_mr_init_user(struct rxe_dev *rxe, u64 start, u64 length,
+ 	return err;
+ }
+ 
++/* Resolve the umem_odp that backs the requested VA range on an implicit
++ * MR. For the prototype I cache a single child on the MR: if the cached
++ * child covers the range I reuse it, otherwise I release it and allocate
++ * a fresh one. A production implementation would keep an xarray of
++ * children keyed by start address. */
++static struct ib_umem_odp *rxe_odp_resolve_implicit(struct rxe_mr *mr,
++						    u64 iova, int length)
++{
++	struct ib_umem_odp *parent = to_ib_umem_odp(mr->umem);
++	struct ib_umem_odp *child = mr->odp_child;
++	unsigned long start, end;
++
++	start = ALIGN_DOWN(iova, PAGE_SIZE);
++	end = ALIGN(iova + length, PAGE_SIZE);
++
++	if (child &&
++	    start >= ib_umem_start(child) &&
++	    end <= ib_umem_end(child))
++		return child;
++
++	if (child) {
++		/* The cached child does not cover this access. I release it
++		 * and allocate a new one. This is the simplification that
++		 * limits the prototype to one active range per MR. */
++		ib_umem_odp_release(child);
++		mr->odp_child = NULL;
++	}
++
++	child = ib_umem_odp_alloc_child(parent, start, end - start,
++					&rxe_mn_ops);
++	if (IS_ERR(child))
++		return child;
++
++	child->private = mr;
++	mr->odp_child = child;
++	return child;
++}
++
++/* Pick the umem_odp to use for an operation on mr at [iova, iova+length).
++ * For explicit MRs that is mr->umem itself; for implicit MRs it is the
++ * resolved child. */
++static struct ib_umem_odp *rxe_odp_umem_for_iova(struct rxe_mr *mr,
++						 u64 iova, int length)
++{
++	struct ib_umem_odp *umem_odp = to_ib_umem_odp(mr->umem);
++
++	if (umem_odp->is_implicit_odp)
++		return rxe_odp_resolve_implicit(mr, iova, length);
++	return umem_odp;
++}
++
+ static inline bool rxe_check_pagefault(struct ib_umem_odp *umem_odp, u64 iova,
+ 				       int length)
+ {
+@@ -157,15 +252,23 @@ static unsigned long rxe_odp_iova_to_page_offset(struct ib_umem_odp *umem_odp, u
+ 	return iova & (BIT(umem_odp->page_shift) - 1);
+ }
+ 
+-static int rxe_odp_map_range_and_lock(struct rxe_mr *mr, u64 iova, int length, u32 flags)
++/* On success the caller holds the chosen umem_odp's umem_mutex and gets
++ * the umem_odp via *out_umem_odp. On failure the lock is not held. */
++static int rxe_odp_map_range_and_lock(struct rxe_mr *mr, u64 iova, int length,
++				      u32 flags,
++				      struct ib_umem_odp **out_umem_odp)
+ {
+-	struct ib_umem_odp *umem_odp = to_ib_umem_odp(mr->umem);
++	struct ib_umem_odp *umem_odp;
+ 	bool need_fault;
+ 	int err;
+ 
+ 	if (unlikely(length < 1))
+ 		return -EINVAL;
+ 
++	umem_odp = rxe_odp_umem_for_iova(mr, iova, length);
++	if (IS_ERR(umem_odp))
++		return PTR_ERR(umem_odp);
++
+ 	mutex_lock(&umem_odp->umem_mutex);
+ 
+ 	need_fault = rxe_check_pagefault(umem_odp, iova, length);
+@@ -173,23 +276,25 @@ static int rxe_odp_map_range_and_lock(struct rxe_mr *mr, u64 iova, int length, u
+ 		mutex_unlock(&umem_odp->umem_mutex);
+ 
+ 		/* umem_mutex is locked on success. */
+-		err = rxe_odp_do_pagefault_and_lock(mr, iova, length,
++		err = rxe_odp_do_pagefault_and_lock(umem_odp, iova, length,
+ 						    flags);
+ 		if (err < 0)
+ 			return err;
+ 
+ 		need_fault = rxe_check_pagefault(umem_odp, iova, length);
+-		if (need_fault)
++		if (need_fault) {
++			mutex_unlock(&umem_odp->umem_mutex);
+ 			return -EFAULT;
++		}
+ 	}
+ 
++	*out_umem_odp = umem_odp;
+ 	return 0;
+ }
+ 
+-static int __rxe_odp_mr_copy(struct rxe_mr *mr, u64 iova, void *addr,
++static int __rxe_odp_mr_copy(struct ib_umem_odp *umem_odp, u64 iova, void *addr,
+ 			     int length, enum rxe_mr_copy_dir dir)
+ {
+-	struct ib_umem_odp *umem_odp = to_ib_umem_odp(mr->umem);
+ 	struct page *page;
+ 	int idx, bytes;
+ 	size_t offset;
+@@ -225,7 +330,7 @@ static int __rxe_odp_mr_copy(struct rxe_mr *mr, u64 iova, void *addr,
+ int rxe_odp_mr_copy(struct rxe_mr *mr, u64 iova, void *addr, int length,
+ 		    enum rxe_mr_copy_dir dir)
+ {
+-	struct ib_umem_odp *umem_odp = to_ib_umem_odp(mr->umem);
++	struct ib_umem_odp *umem_odp;
+ 	u32 flags = RXE_PAGEFAULT_DEFAULT;
+ 	int err;
+ 
+@@ -247,17 +352,26 @@ int rxe_odp_mr_copy(struct rxe_mr *mr, u64 iova, void *addr, int length,
+ 		return -EINVAL;
+ 	}
+ 
+-	err = rxe_odp_map_range_and_lock(mr, iova, length, flags);
++	err = rxe_odp_map_range_and_lock(mr, iova, length, flags, &umem_odp);
+ 	if (err)
+ 		return err;
+ 
+-	err =  __rxe_odp_mr_copy(mr, iova, addr, length, dir);
++	err = __rxe_odp_mr_copy(umem_odp, iova, addr, length, dir);
+ 
+ 	mutex_unlock(&umem_odp->umem_mutex);
+ 
+ 	return err;
+ }
+ 
++/* Implicit MRs reject remote access at registration, so the atomic and
++ * flush paths can only be hit through a local-side bug. Guard explicitly
++ * anyway: those paths assume an explicit umem layout with mr->umem
++ * holding the pfn_list directly, which is not true for implicit. */
++static inline bool rxe_odp_mr_is_implicit(struct rxe_mr *mr)
++{
++	return to_ib_umem_odp(mr->umem)->is_implicit_odp;
++}
++
+ static enum resp_states rxe_odp_do_atomic_op(struct rxe_mr *mr, u64 iova,
+ 					     int opcode, u64 compare,
+ 					     u64 swap_add, u64 *orig_val)
+@@ -312,11 +426,16 @@ static enum resp_states rxe_odp_do_atomic_op(struct rxe_mr *mr, u64 iova,
+ enum resp_states rxe_odp_atomic_op(struct rxe_mr *mr, u64 iova, int opcode,
+ 				   u64 compare, u64 swap_add, u64 *orig_val)
+ {
+-	struct ib_umem_odp *umem_odp = to_ib_umem_odp(mr->umem);
++	struct ib_umem_odp *umem_odp;
+ 	int err;
+ 
++	if (rxe_odp_mr_is_implicit(mr)) {
++		rxe_dbg_mr(mr, "atomic op not supported on implicit ODP MR\n");
++		return RESPST_ERR_RKEY_VIOLATION;
++	}
++
+ 	err = rxe_odp_map_range_and_lock(mr, iova, sizeof(char),
+-					 RXE_PAGEFAULT_DEFAULT);
++					 RXE_PAGEFAULT_DEFAULT, &umem_odp);
+ 	if (err < 0)
+ 		return RESPST_ERR_RKEY_VIOLATION;
+ 
+@@ -330,7 +449,7 @@ enum resp_states rxe_odp_atomic_op(struct rxe_mr *mr, u64 iova, int opcode,
+ int rxe_odp_flush_pmem_iova(struct rxe_mr *mr, u64 iova,
+ 			    unsigned int length)
+ {
+-	struct ib_umem_odp *umem_odp = to_ib_umem_odp(mr->umem);
++	struct ib_umem_odp *umem_odp;
+ 	unsigned int page_offset;
+ 	unsigned long index;
+ 	struct page *page;
+@@ -338,8 +457,11 @@ int rxe_odp_flush_pmem_iova(struct rxe_mr *mr, u64 iova,
+ 	int err;
+ 	u8 *va;
+ 
++	if (rxe_odp_mr_is_implicit(mr))
++		return -EOPNOTSUPP;
++
+ 	err = rxe_odp_map_range_and_lock(mr, iova, length,
+-					 RXE_PAGEFAULT_DEFAULT);
++					 RXE_PAGEFAULT_DEFAULT, &umem_odp);
+ 	if (err)
+ 		return err;
+ 
+@@ -368,13 +490,16 @@ int rxe_odp_flush_pmem_iova(struct rxe_mr *mr, u64 iova,
+ 
+ enum resp_states rxe_odp_do_atomic_write(struct rxe_mr *mr, u64 iova, u64 value)
+ {
+-	struct ib_umem_odp *umem_odp = to_ib_umem_odp(mr->umem);
++	struct ib_umem_odp *umem_odp;
+ 	unsigned int page_offset;
+ 	unsigned long index;
+ 	struct page *page;
+ 	int err;
+ 	u64 *va;
+ 
++	if (rxe_odp_mr_is_implicit(mr))
++		return RESPST_ERR_RKEY_VIOLATION;
++
+ 	/* See IBA oA19-28 */
+ 	err = mr_check_range(mr, iova, sizeof(value));
+ 	if (unlikely(err)) {
+@@ -383,7 +508,7 @@ enum resp_states rxe_odp_do_atomic_write(struct rxe_mr *mr, u64 iova, u64 value)
+ 	}
+ 
+ 	err = rxe_odp_map_range_and_lock(mr, iova, sizeof(value),
+-					 RXE_PAGEFAULT_DEFAULT);
++					 RXE_PAGEFAULT_DEFAULT, &umem_odp);
+ 	if (err)
+ 		return RESPST_ERR_RKEY_VIOLATION;
+ 
+@@ -419,6 +544,27 @@ struct prefetch_mr_work {
+ 	} frags[];
+ };
+ 
++/* For prefetch I resolve the umem_odp the same way as the SGE walker so
++ * an implicit MR can be prefetched correctly. */
++static int rxe_odp_prefetch_one(struct rxe_mr *mr, u64 io_virt, size_t length,
++				u32 pf_flags)
++{
++	struct ib_umem_odp *umem_odp;
++	int ret;
++
++	umem_odp = rxe_odp_umem_for_iova(mr, io_virt, length);
++	if (IS_ERR(umem_odp))
++		return PTR_ERR(umem_odp);
++
++	ret = rxe_odp_do_pagefault_and_lock(umem_odp, io_virt, length,
++					    pf_flags);
++	if (ret < 0)
++		return ret;
++
++	mutex_unlock(&umem_odp->umem_mutex);
++	return 0;
++}
++
+ static void rxe_ib_prefetch_mr_work(struct work_struct *w)
+ {
+ 	struct prefetch_mr_work *work =
+@@ -432,22 +578,14 @@ static void rxe_ib_prefetch_mr_work(struct work_struct *w)
+ 	 */
+ 	WARN_ON(!work->num_sge);
+ 	for (i = 0; i < work->num_sge; ++i) {
+-		struct ib_umem_odp *umem_odp;
+-
+-		ret = rxe_odp_do_pagefault_and_lock(work->frags[i].mr,
+-						    work->frags[i].io_virt,
+-						    work->frags[i].length,
+-						    work->pf_flags);
+-		if (ret < 0) {
++		ret = rxe_odp_prefetch_one(work->frags[i].mr,
++					   work->frags[i].io_virt,
++					   work->frags[i].length,
++					   work->pf_flags);
++		if (ret < 0)
+ 			rxe_dbg_mr(work->frags[i].mr,
+ 				   "failed to prefetch the mr\n");
+-			goto deref;
+-		}
+-
+-		umem_odp = to_ib_umem_odp(work->frags[i].mr->umem);
+-		mutex_unlock(&umem_odp->umem_mutex);
+ 
+-deref:
+ 		rxe_put(work->frags[i].mr);
+ 	}
+ 
+@@ -465,7 +603,6 @@ static int rxe_ib_prefetch_sg_list(struct ib_pd *ibpd,
+ 
+ 	for (i = 0; i < num_sge; ++i) {
+ 		struct rxe_mr *mr;
+-		struct ib_umem_odp *umem_odp;
+ 
+ 		mr = lookup_mr(pd, IB_ACCESS_LOCAL_WRITE,
+ 			       sg_list[i].lkey, RXE_LOOKUP_LOCAL);
+@@ -483,17 +620,14 @@ static int rxe_ib_prefetch_sg_list(struct ib_pd *ibpd,
+ 			return -EPERM;
+ 		}
+ 
+-		ret = rxe_odp_do_pagefault_and_lock(
+-			mr, sg_list[i].addr, sg_list[i].length, pf_flags);
++		ret = rxe_odp_prefetch_one(mr, sg_list[i].addr,
++					   sg_list[i].length, pf_flags);
+ 		if (ret < 0) {
+ 			rxe_dbg_mr(mr, "failed to prefetch the mr\n");
+ 			rxe_put(mr);
+ 			return ret;
+ 		}
+ 
+-		umem_odp = to_ib_umem_odp(mr->umem);
+-		mutex_unlock(&umem_odp->umem_mutex);
+-
+ 		rxe_put(mr);
+ 	}
+ 
+diff --git a/drivers/infiniband/sw/rxe/rxe_verbs.h b/drivers/infiniband/sw/rxe/rxe_verbs.h
+index fd48075..1ffc511 100644
+--- a/drivers/infiniband/sw/rxe/rxe_verbs.h
++++ b/drivers/infiniband/sw/rxe/rxe_verbs.h
+@@ -335,12 +335,21 @@ static inline int rkey_is_mw(u32 rkey)
+ 	return (index >= RXE_MIN_MW_INDEX) && (index <= RXE_MAX_MW_INDEX);
+ }
+ 
++struct ib_umem_odp;
++
+ struct rxe_mr {
+ 	struct rxe_pool_elem	elem;
+ 	struct ib_mr		ibmr;
+ 
+ 	struct ib_umem		*umem;
+ 
++	/* For implicit ODP MRs only: a single child umem covering the most
++	 * recently accessed VA range. Production code would keep an xarray
++	 * of children keyed by start; I keep one for the prototype. NULL
++	 * for explicit MRs and for fresh implicit MRs that have not yet
++	 * been touched. */
++	struct ib_umem_odp	*odp_child;
++
+ 	u32			lkey;
+ 	u32			rkey;
+ 	enum rxe_mr_state	state;
 -- 
-2.43.0
+2.39.5 (Apple Git-154)
 
