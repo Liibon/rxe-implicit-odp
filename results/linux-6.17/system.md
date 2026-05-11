@@ -10,6 +10,7 @@
 | cpus | 4 |
 | memory | 5.8Gi |
 | rdma-core | 1.14.50.0 |
+| THP | `[always]` (auto-promote anonymous mappings to 2 MiB folios) |
 | RXE_ODP_CHILD_SHIFT | 21 (2 MiB chunks) |
 
 ## ODP caps reported by the patched device
@@ -29,10 +30,19 @@
   2 MiB chunks of one implicit MR, both delivered. Exercises the xarray
   by forcing two distinct child umems to coexist on the same MR.
 
-## Bench notes
+## Bench
 
-- The 1 GiB explicit row fails to allocate inside the 6 GiB VM. That is
-  itself the property in question: explicit registration needs the
-  backing memory available at registration time; implicit does not.
-- Each (mode, size) measured ITERS=5 times after a warmup pass.
-- Latency measured around ibv_reg_mr only.
+- See `NOTES.md` for the full CSV schema and methodology.
+- n=30 samples per (mode, requested_size) bucket, shuffled order, one
+  warmup iteration per bucket discarded.
+- The 1 GiB explicit row shows `fail_count=30, errno=12 (ENOMEM)` and
+  empty latency stats. The bench keeps the row rather than dropping it,
+  because that failure is itself the property under test: explicit
+  registration cannot proceed without backing memory available, implicit
+  registers in microseconds with RSS unchanged.
+- `rss_after_kb` in `reg_latency.csv` makes the underlying contrast
+  explicit: explicit pins pages so RSS climbs with size, implicit does
+  not.
+- `reg_latency_nothp.csv` is a companion run with `MADV_NOHUGEPAGE` on
+  explicit buffers, showing the same shape with steeper per-byte cost
+  when the kernel cannot collapse 2 MiB folios.
