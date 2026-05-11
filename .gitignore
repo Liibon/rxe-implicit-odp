@@ -1,0 +1,7 @@
+*.o
+*.d
+tests/implicit_odp_reg_test
+tests/implicit_odp_write_test
+bench/bench_reg_latency
+results/**/reg_latency.png
+!results/**/.gitkeep
