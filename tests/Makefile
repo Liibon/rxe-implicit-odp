@@ -1,7 +1,7 @@
 CFLAGS  ?= -O2 -Wall -Wextra -Wno-unused-parameter
 LDLIBS  ?= -libverbs
 
-BINS := implicit_odp_reg_test implicit_odp_write_test
+BINS := implicit_odp_reg_test implicit_odp_write_test implicit_odp_multi_test
 
 all: $(BINS)
 
@@ -9,6 +9,9 @@ implicit_odp_reg_test: implicit_odp_reg_test.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDLIBS)
 
 implicit_odp_write_test: implicit_odp_write_test.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDLIBS)
+
+implicit_odp_multi_test: implicit_odp_multi_test.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDLIBS)
 
 clean:

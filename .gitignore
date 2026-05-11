@@ -2,4 +2,5 @@
 *.d
 tests/implicit_odp_reg_test
 tests/implicit_odp_write_test
+tests/implicit_odp_multi_test
 bench/bench_reg_latency

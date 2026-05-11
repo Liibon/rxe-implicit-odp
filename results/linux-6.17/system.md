@@ -10,6 +10,7 @@
 | cpus | 4 |
 | memory | 5.8Gi |
 | rdma-core | 1.14.50.0 |
+| RXE_ODP_CHILD_SHIFT | 21 (2 MiB chunks) |
 
 ## ODP caps reported by the patched device
 
@@ -23,10 +24,10 @@
 ## Tests
 
 - tests/implicit_odp_reg_test: 5/5 cases pass.
-- tests/implicit_odp_write_test: passes. 64 KiB RDMA WRITE delivered using
-  an implicit ODP local lkey on a same-device RC loopback. The source
-  buffer is plain anonymous mmap memory faulted in on first SGE access
-  through a lazily allocated child umem.
+- tests/implicit_odp_write_test: 64 KiB RDMA WRITE through implicit lkey passes.
+- tests/implicit_odp_multi_test: two RDMA WRITEs from buffers in different
+  2 MiB chunks of one implicit MR, both delivered. Exercises the xarray
+  by forcing two distinct child umems to coexist on the same MR.
 
 ## Bench notes
 
