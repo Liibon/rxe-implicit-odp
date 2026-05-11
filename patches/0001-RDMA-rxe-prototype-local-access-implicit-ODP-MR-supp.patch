@@ -1,0 +1,122 @@
+From 4227171aab1656d37f2964a80b00d8c7bb3b73ce Mon Sep 17 00:00:00 2001
+From: Liibaan Egal <liibaaneagle@gmail.com>
+Date: Mon, 11 May 2026 14:20:43 -0500
+Subject: [PATCH] RDMA/rxe: prototype local-access implicit ODP MR support
+
+RXE currently rejects the implicit ODP registration form (addr == 0,
+length == U64_MAX, IB_ACCESS_ON_DEMAND) because it only sets up explicit
+ODP umems via ib_umem_odp_get(). The implicit branch was a placeholder
+with a Never reach here comment.
+
+Wire the implicit case through ib_umem_odp_alloc_implicit(), restricted
+to local access only. Remote access bits are rejected with EOPNOTSUPP at
+registration time: the child-umem on-demand creation path in the local
+SGE walker is sufficient to support local-access semantics, while a
+remote rkey on an implicit MR would expose arbitrary process VA to a
+peer without the protections that explicit ODP currently relies on.
+
+The general_caps advertisement is extended with IB_ODP_SUPPORT_IMPLICIT
+so userspace can detect the prototype support. Per-transport caps stay
+unchanged: those describe RC/UD behavior on explicit ODP MRs and remain
+accurate for that path.
+
+This is a prototype, not an upstream submission. See CLAIMS.md in the
+companion rxe-implicit-odp repository for the scope boundary and the
+verbs tests that cover the registration accept/reject matrix.
+
+Signed-off-by: Liibaan Egal <liibaaneagle@gmail.com>
+---
+ drivers/infiniband/sw/rxe/rxe.c     |  7 +++-
+ drivers/infiniband/sw/rxe/rxe_odp.c | 50 ++++++++++++++++++++++++++++-
+ 2 files changed, 55 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/infiniband/sw/rxe/rxe.c b/drivers/infiniband/sw/rxe/rxe.c
+index e891199cb..a8107a1ef 100644
+--- a/drivers/infiniband/sw/rxe/rxe.c
++++ b/drivers/infiniband/sw/rxe/rxe.c
+@@ -92,8 +92,13 @@ static void rxe_init_device_param(struct rxe_dev *rxe, struct net_device *ndev)
+ 	if (IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING)) {
+ 		rxe->attr.kernel_cap_flags |= IBK_ON_DEMAND_PAGING;
+ 
+-		/* IB_ODP_SUPPORT_IMPLICIT is not supported right now. */
+ 		rxe->attr.odp_caps.general_caps |= IB_ODP_SUPPORT;
++		/* I advertise IMPLICIT here. The fault path in rxe_odp.c only
++		 * supports local-access on implicit MRs, so I rely on the
++		 * registration path to reject remote-access implicit forms.
++		 * Per-transport caps below stay unchanged: those describe what
++		 * works on explicit ODP MRs and remain accurate. */
++		rxe->attr.odp_caps.general_caps |= IB_ODP_SUPPORT_IMPLICIT;
+ 
+ 		rxe->attr.odp_caps.per_transport_caps.ud_odp_caps |= IB_ODP_SUPPORT_SEND;
+ 		rxe->attr.odp_caps.per_transport_caps.ud_odp_caps |= IB_ODP_SUPPORT_RECV;
+diff --git a/drivers/infiniband/sw/rxe/rxe_odp.c b/drivers/infiniband/sw/rxe/rxe_odp.c
+index f58e3ec62..039bff218 100644
+--- a/drivers/infiniband/sw/rxe/rxe_odp.c
++++ b/drivers/infiniband/sw/rxe/rxe_odp.c
+@@ -76,6 +76,54 @@ static int rxe_odp_init_pages(struct rxe_mr *mr)
+ 	return ret >= 0 ? 0 : ret;
+ }
+ 
++/* I keep the remote-access mask local to this file. The implicit form is
++ * gated to local access only for this prototype: a remote rkey on an
++ * implicit MR would let a peer fault arbitrary user pages, which the fault
++ * path does not yet defend against. */
++#define RXE_REMOTE_ACCESS_MASK (IB_ACCESS_REMOTE_READ |	\
++				IB_ACCESS_REMOTE_WRITE |	\
++				IB_ACCESS_REMOTE_ATOMIC)
++
++static int rxe_odp_mr_init_implicit(struct rxe_dev *rxe, int access_flags,
++				    struct rxe_mr *mr)
++{
++	struct ib_umem_odp *umem_odp;
++
++	/* Reject remote access bits before allocating anything. Returning
++	 * EOPNOTSUPP here is intentional: the access combo is valid in the
++	 * verbs ABI but out of scope for this prototype. */
++	if (access_flags & RXE_REMOTE_ACCESS_MASK)
++		return -EOPNOTSUPP;
++
++	/* For implicit MRs ib_umem_odp_alloc_implicit() builds the empty
++	 * parent umem. No pages are pinned and no per-page list is allocated,
++	 * which is the whole point of implicit registration: registration
++	 * cost should not scale with region size. Child umems are created on
++	 * demand at first access. */
++	umem_odp = ib_umem_odp_alloc_implicit(&rxe->ib_dev, access_flags);
++	if (IS_ERR(umem_odp)) {
++		rxe_dbg_mr(mr, "implicit umem alloc failed err=%d\n",
++			   (int)PTR_ERR(umem_odp));
++		return PTR_ERR(umem_odp);
++	}
++
++	umem_odp->private = mr;
++	mr->umem = &umem_odp->umem;
++	mr->access = access_flags;
++	mr->ibmr.length = U64_MAX;
++	mr->ibmr.iova = 0;
++	mr->page_offset = 0;
++
++	/* I skip rxe_odp_init_pages() here: there are no pages to fault in at
++	 * registration time. The lkey is immediately valid for local SGE use.
++	 * The fault path resolves pages lazily via ib_umem_odp_get() on a
++	 * child range when a local access first touches it. */
++	mr->state = RXE_MR_STATE_VALID;
++	mr->ibmr.type = IB_MR_TYPE_USER;
++
++	return 0;
++}
++
+ int rxe_odp_mr_init_user(struct rxe_dev *rxe, u64 start, u64 length,
+ 			 u64 iova, int access_flags, struct rxe_mr *mr)
+ {
+@@ -93,7 +141,7 @@ int rxe_odp_mr_init_user(struct rxe_dev *rxe, u64 start, u64 length,
+ 		if (!(rxe->attr.odp_caps.general_caps & IB_ODP_SUPPORT_IMPLICIT))
+ 			return -EINVAL;
+ 
+-		/* Never reach here, for implicit ODP is not implemented. */
++		return rxe_odp_mr_init_implicit(rxe, access_flags, mr);
+ 	}
+ 
+ 	umem_odp = ib_umem_odp_get(&rxe->ib_dev, start, length, access_flags,
+-- 
+2.43.0
+
