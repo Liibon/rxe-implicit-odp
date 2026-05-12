@@ -1,3 +1,6 @@
+From 3589099f65a73e2ad9c2f5c20d75f0eb3a4ea793 Mon Sep 17 00:00:00 2001
+From: Liibaan Egal <liibaaneagle@gmail.com>
+Date: Tue, 12 May 2026 14:02:49 -0500
 Subject: [RFC PATCH rdma-next 0/2] RDMA/rxe: add local implicit ODP MR support
 
 This RFC adds local-access implicit On-Demand Paging memory regions to
@@ -102,3 +105,17 @@ Liibaan Egal (2):
  drivers/infiniband/sw/rxe/rxe_odp.c   | 288 +++++++++++++++++++++++++++-------
  drivers/infiniband/sw/rxe/rxe_verbs.h |  18 +++
  4 files changed, 275 insertions(+), 57 deletions(-)
+
+Liibaan Egal (2):
+  RDMA/rxe: add local implicit ODP MR support
+  RDMA/rxe: advertise IB_ODP_SUPPORT_IMPLICIT for local access
+
+ drivers/infiniband/sw/rxe/rxe.c       |   7 +-
+ drivers/infiniband/sw/rxe/rxe_mr.c    |  19 ++
+ drivers/infiniband/sw/rxe/rxe_odp.c   | 288 +++++++++++++++++++++-----
+ drivers/infiniband/sw/rxe/rxe_verbs.h |  18 ++
+ 4 files changed, 275 insertions(+), 57 deletions(-)
+
+-- 
+2.43.0
+

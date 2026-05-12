@@ -1,0 +1,48 @@
+From 3589099f65a73e2ad9c2f5c20d75f0eb3a4ea793 Mon Sep 17 00:00:00 2001
+From: Liibaan Egal <liibaaneagle@gmail.com>
+Date: Tue, 12 May 2026 14:02:08 -0500
+Subject: [RFC PATCH rdma-next 2/2] RDMA/rxe: advertise IB_ODP_SUPPORT_IMPLICIT
+ for local access
+
+Now that the implicit ODP registration and local SGE fault paths are
+in place, advertise IB_ODP_SUPPORT_IMPLICIT in general_odp_caps so
+userspace can probe the support via ibv_query_device.
+
+The advertised support is intentionally scoped to local access:
+remote rkey access on implicit MRs is rejected at registration time,
+and the atomic, flush, and atomic-write paths reject implicit MRs at
+the top of each helper.
+
+Question for reviewers: is IB_ODP_SUPPORT_IMPLICIT the right
+capability bit to advertise for this local-access-only operation
+matrix, or should capability exposure wait for broader operation
+coverage? The cap-flip is kept in its own patch so the policy
+decision is separable from the implementation.
+
+Signed-off-by: Liibaan Egal <liibaaneagle@gmail.com>
+---
+ drivers/infiniband/sw/rxe/rxe.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/infiniband/sw/rxe/rxe.c b/drivers/infiniband/sw/rxe/rxe.c
+index b0714f9abe..581313591d 100644
+--- a/drivers/infiniband/sw/rxe/rxe.c
++++ b/drivers/infiniband/sw/rxe/rxe.c
+@@ -94,8 +94,13 @@ static void rxe_init_device_param(struct rxe_dev *rxe, struct net_device *ndev)
+ 	if (IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING)) {
+ 		rxe->attr.kernel_cap_flags |= IBK_ON_DEMAND_PAGING;
+ 
+-		/* IB_ODP_SUPPORT_IMPLICIT is not supported right now. */
+ 		rxe->attr.odp_caps.general_caps |= IB_ODP_SUPPORT;
++		/* IMPLICIT is gated to the local-access subset. The fault path
++		 * in rxe_odp.c rejects remote-access implicit forms at
++		 * registration time. Per-transport caps below stay unchanged:
++		 * they describe explicit ODP MR semantics and remain accurate.
++		 */
++		rxe->attr.odp_caps.general_caps |= IB_ODP_SUPPORT_IMPLICIT;
+ 
+ 		rxe->attr.odp_caps.per_transport_caps.ud_odp_caps |= IB_ODP_SUPPORT_SEND;
+ 		rxe->attr.odp_caps.per_transport_caps.ud_odp_caps |= IB_ODP_SUPPORT_RECV;
+-- 
+2.43.0
+

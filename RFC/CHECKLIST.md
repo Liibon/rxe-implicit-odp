@@ -7,8 +7,14 @@ these steps on a machine where you have:
 - git send-email (Debian/Ubuntu: `sudo apt-get install git-email`)
 - An SMTP account you can authenticate with
 
-The patches are in `RFC/outgoing/` after `make rfc` from the repo root
-(see `RFC/build-rfc.sh`).
+The 2-patch series plus cover letter is in `RFC/outgoing/`:
+
+- `0000-cover-letter.patch`
+- `0001-RDMA-rxe-add-local-implicit-ODP-MR-support.patch`
+- `0002-RDMA-rxe-advertise-IB_ODP_SUPPORT_IMPLICIT-for-local.patch`
+
+Each runs clean through `scripts/checkpatch.pl --strict` (0 errors,
+0 warnings, 0 checks).
 
 ## 1. Configure git send-email once
 
@@ -60,13 +66,13 @@ up, fix and re-export.
 git send-email \
   --to liibaaneagle@gmail.com \
   --suppress-cc=all \
-  RFC/outgoing/0000-*.patch RFC/outgoing/000[1-4]-*.patch
+  RFC/outgoing/0000-*.patch RFC/outgoing/000[1-2]-*.patch
 ```
 
 Open the result in your mail client. Check:
 
-- Subject line is `[RFC PATCH rdma-next 0/4] ...`
-- Numbered patches are `[RFC PATCH rdma-next 1/4] ...` etc.
+- Subject line is `[RFC PATCH rdma-next 0/2] ...`
+- Numbered patches are `[RFC PATCH rdma-next 1/2] ...` and `2/2`
 - Patches are inline plain text (not attachments).
 - No mangled whitespace.
 - The cover letter renders.
@@ -80,7 +86,7 @@ git send-email \
   --cc jgg@ziepe.ca \
   --cc leon@kernel.org \
   --cc linux-kernel@vger.kernel.org \
-  RFC/outgoing/0000-*.patch RFC/outgoing/000[1-4]-*.patch
+  RFC/outgoing/0000-*.patch RFC/outgoing/000[1-2]-*.patch
 ```
 
 git send-email will print each recipient and ask for confirmation
