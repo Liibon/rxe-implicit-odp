@@ -1,6 +1,17 @@
 # RXE local-access implicit ODP
 
-Prototype local-access implicit On-Demand Paging for Linux Soft-RoCE/RXE.
+Local-access implicit On-Demand Paging for Linux Soft-RoCE/RXE.
+
+**Status: RFC sent to linux-rdma, 2026-05-12, awaiting review.**
+
+- Cover letter: https://lore.kernel.org/r/20260512201453.21156-1-liibaegal@gmail.com
+- Patch 1/2: https://lore.kernel.org/r/20260512201453.21156-2-liibaegal@gmail.com
+- Patch 2/2: https://lore.kernel.org/r/20260512201453.21156-3-liibaegal@gmail.com
+- Thread: https://lore.kernel.org/r/20260512201453.21156-1-liibaegal@gmail.com/T/
+
+Rebased on `rdma/for-next` (Linux 7.1-rc2). Both patches pass
+`scripts/checkpatch.pl --strict` cleanly. See `RFC/COVER_LETTER.txt`
+and `RFC/outgoing/`.
 
 Implemented registration form:
 
@@ -79,9 +90,9 @@ The full scope boundary is in [CLAIMS.md](CLAIMS.md). The headline limits:
 - **No remote rkey on implicit MRs.** Remote-access bits are rejected at
   registration time. Exposing implicit-shaped MRs to peers needs its own
   threat-model discussion.
-- **Not an upstream submission yet.** This is a prototype patch series.
-  An RFC against `rdma/for-next` is the planned next step. See the patch
-  cover material in `patches/`.
+- **Not merged.** RFC v1 is on linux-rdma awaiting review. A v2 may
+  follow based on feedback (see `RFC/COVER_LETTER.txt` for the open
+  questions raised).
 - **Registration-only bench.** The included benchmark intentionally
   measures registration-time work. ODP shifts cost to first-touch / fault
   paths; separate first-touch and steady-state benchmarks are needed to

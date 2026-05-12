@@ -49,7 +49,8 @@
   over its lifetime: once a chunk is touched its child stays until MR
   destroy. Long-lived MRs that walk a sparse address space would
   accumulate children. A real implementation would add a reclaim path.
-- Upstream submission.
+- Merged upstream. RFC v1 sent to linux-rdma on 2026-05-12, awaiting
+  maintainer review. See README for lore links.
 - Hardware RDMA comparison.
 
 ## Why this matters
