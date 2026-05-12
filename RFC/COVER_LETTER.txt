@@ -1,0 +1,109 @@
+Subject: [RFC PATCH rdma-next 0/4] RDMA/rxe: add local implicit ODP MR support
+
+This RFC adds local-access implicit On-Demand Paging memory regions to
+RXE (Soft-RoCE).
+
+RXE already supports explicit ODP MRs. The implicit registration form
+(addr == 0, length == U64_MAX, IB_ACCESS_ON_DEMAND) is recognized but
+not implemented: the implicit branch in rxe_odp_mr_init_user() returns
+-EINVAL through a placeholder block, and no path creates child umems
+for SGE accesses on an implicit MR.
+
+This series wires the implicit registration case through
+ib_umem_odp_alloc_implicit() and routes the local SGE walker through
+per-chunk child umems. The chunk size is fixed at 2 MiB
+(RXE_ODP_CHILD_SHIFT = 21) and children are allocated lazily on first
+access via ib_umem_odp_alloc_child(), stored in a per-MR xarray.
+
+Patches
+-------
+
+  1/4 RDMA/rxe: factor ODP helpers to operate on umem_odp directly
+
+      Pure refactor. rxe_odp_do_pagefault_and_lock,
+      rxe_odp_map_range_and_lock, __rxe_odp_mr_copy, rxe_odp_mr_copy
+      and the prefetch path now thread the chosen umem_odp explicitly
+      instead of looking it up from mr->umem on each call. No
+      functional change.
+
+  2/4 RDMA/rxe: accept local-access implicit ODP MR registration
+
+      Replace the "Never reach here" branch with a real
+      rxe_odp_mr_init_implicit() that rejects remote access bits
+      (-EOPNOTSUPP), allocates the parent umem via
+      ib_umem_odp_alloc_implicit(), and initializes the per-MR child
+      xarray. SGE access on an implicit MR still returns -EOPNOTSUPP
+      at this commit.
+
+  3/4 RDMA/rxe: resolve implicit ODP SGE access through child umems
+
+      Add rxe_odp_get_child() and the chunk loop in rxe_odp_mr_copy()
+      and the prefetch path. Atomic, flush and atomic-write paths
+      reject implicit MRs at the top because those helpers walk
+      mr->umem->pfn_list directly which is empty for an implicit
+      parent. Cleanup walks the xarray and releases each child before
+      the parent.
+
+  4/4 RDMA/rxe: advertise IB_ODP_SUPPORT_IMPLICIT
+
+      Flip the general_caps bit.
+
+Question for reviewers
+----------------------
+
+Patch 4 advertises IB_ODP_SUPPORT_IMPLICIT for a local-access-only
+operation matrix: local SGE write/read source/destination work; remote
+rkey access, atomics, flush, and atomic-write on implicit MRs do not.
+Is this an acceptable use of the capability bit, or should capability
+exposure wait for a broader operation matrix? Splitting the cap-flip
+into its own patch is meant to keep that decision separable from the
+implementation.
+
+Scope and limitations
+---------------------
+
+Out of scope in this series:
+
+- Remote rkey access on implicit MRs. Rejected at registration time.
+- Atomic, flush, atomic-write paths. These return -EOPNOTSUPP /
+  RESPST_ERR_RKEY_VIOLATION on implicit MRs.
+- Child reclaim. The xarray grows monotonically per MR; a child is
+  not freed until MR destroy. Long-lived implicit MRs that touch a
+  sparse address space accumulate children. A reclaim mechanism is
+  the natural follow-up.
+
+Tested
+------
+
+Verified on Linux 7.1-rc2 (arm64, Soft-RoCE over loopback):
+
+- Registration accept/reject matrix (5 cases).
+- Single-chunk 64 KiB RDMA WRITE through an implicit lkey.
+- Two-chunk multi-range test: two 1 MiB WRITEs from buffers in
+  different 2 MiB chunks of one implicit MR.
+- Cross-chunk single-SGE test: one 128 KiB WRITE whose SGE spans a
+  2 MiB chunk boundary.
+
+Registration latency was measured for 4 KiB to 1 GiB across explicit
+and implicit forms. Explicit grows with size and fails ENOMEM at 1 GiB
+in a 6 GiB host. Implicit median latency stays under ~20 us across
+all sizes. The benchmark measures registration-time work only; it
+does not characterize first-touch or steady-state data path cost.
+Tests, bench and full numbers are in the companion repository
+https://github.com/Liibon/rxe-implicit-odp (mirrored, not authoritative).
+
+checkpatch --strict: 0 errors, 0 warnings, 0 checks.
+
+---
+
+Liibaan Egal (4):
+  RDMA/rxe: factor ODP helpers to operate on umem_odp directly
+  RDMA/rxe: accept local-access implicit ODP MR registration
+  RDMA/rxe: resolve implicit ODP SGE access through child umems
+  RDMA/rxe: advertise IB_ODP_SUPPORT_IMPLICIT
+
+ drivers/infiniband/sw/rxe/rxe.c       |   5 +-
+ drivers/infiniband/sw/rxe/rxe_mr.c    |  17 +-
+ drivers/infiniband/sw/rxe/rxe_odp.c   | 240 +++++++++++++++++++-------
+ drivers/infiniband/sw/rxe/rxe_verbs.h |  16 ++
+ 4 files changed, 211 insertions(+), 67 deletions(-)
