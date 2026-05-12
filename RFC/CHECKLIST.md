@@ -98,8 +98,13 @@ each. Anything that looks wrong, type `n` and re-check.
 - Patchwork: https://patchwork.kernel.org/project/linux-rdma/list/
   Search for the cover-letter subject.
 - lore archive: https://lore.kernel.org/linux-rdma/
-- Subscribe to linux-rdma so replies arrive in your inbox:
-  echo 'subscribe linux-rdma' | mail majordomo@vger.kernel.org
+- Subscribe to linux-rdma so replies arrive in your inbox. vger
+  migrated off majordomo; the new system uses per-list +subscribe
+  addresses with no confirmation step:
+    To:      linux-rdma+subscribe@vger.kernel.org
+    Subject: (anything or blank)
+    Body:    (anything or blank)
+  Reference: https://subspace.kernel.org/subscribing.html
 
 ## 7. Replying to feedback
 
