@@ -58,7 +58,8 @@ Explicit MR registration pins and maps user pages at registration time,
 so the registration call has to do work proportional to the region size
 and needs the memory to be available. Implicit ODP defers page
 resolution to first access, so registration cost is bounded by the
-constant work to set up the umem and notifier. The measured graph is
-the literal restatement of that property on the Soft-RoCE driver. The
-write and multi tests are the proof that the lkey returned at
-registration is real and useful end to end.
+constant work to set up the umem and notifier. The benchmark measures
+registration-time work only; first-touch and steady-state data path
+costs are not characterized here. The write, multi, and cross tests
+verify that the returned lkey can be used for local SGE access in the
+tested paths.

@@ -1,87 +1,83 @@
-From acf5cf600bcb09e6ba0fc2cea395e3054b7b2013 Mon Sep 17 00:00:00 2001
+From 03e31f099115195ab197ba27e85e0631a79894a5 Mon Sep 17 00:00:00 2001
 From: Liibaan Egal <liibaaneagle@gmail.com>
 Date: Mon, 11 May 2026 14:20:43 -0500
-Subject: [PATCH] RDMA/rxe: prototype local-access implicit ODP MR support
+Subject: [PATCH] RDMA/rxe: add local implicit ODP MR support
 
-RXE rejects the implicit ODP registration form (addr == 0,
-length == U64_MAX, IB_ACCESS_ON_DEMAND) because it only sets up
-explicit ODP umems via ib_umem_odp_get(). The implicit branch was a
-placeholder with a Never reach here comment, and no path created
-child umems for SGE accesses on an implicit MR.
+RXE already supports explicit ODP MRs. The implicit registration form
+(addr == 0, length == U64_MAX, IB_ACCESS_ON_DEMAND) is recognized but
+not implemented: the existing implicit branch returns -EINVAL through
+a placeholder block, and no path creates child umems for SGE accesses
+on an implicit MR.
 
 Wire the implicit registration case through ib_umem_odp_alloc_implicit()
 and route the local SGE walker through per-chunk child umems.
 
-Registration. rxe_odp_mr_init_implicit() rejects remote access bits up
-front (-EOPNOTSUPP), allocates the empty parent umem via
-ib_umem_odp_alloc_implicit(), initializes mr->implicit_children via
-xa_init(), and skips rxe_odp_init_pages(): there are no pages to fault
-at registration time.
+Registration. rxe_odp_mr_init_implicit() rejects remote access bits
+(-EOPNOTSUPP), allocates the empty parent umem via
+ib_umem_odp_alloc_implicit(), and initializes mr->implicit_children via
+xa_init(). rxe_odp_init_pages() is skipped because there are no pages
+to fault at registration time.
 
 Chunking. Implicit MRs split the address space into fixed-size chunks
-defined by RXE_ODP_CHILD_SHIFT (21, i.e. 2 MiB). Each chunk is backed
-by at most one child ib_umem_odp allocated on demand. 2 MiB matches
-the typical THP size on common arches, so a chunk can be served by a
-huge page where one is available.
+defined by RXE_ODP_CHILD_SHIFT (21, 2 MiB). Each chunk is backed by at
+most one child ib_umem_odp allocated on demand. The chunk size keeps
+the child count bounded while limiting the amount of VA covered by
+each child; whether the size should be fixed, derived, or configurable
+is an open design question.
 
 SGE fault path. rxe_odp_umem_for_iova() returns the parent for
 explicit MRs and rxe_odp_get_child() for implicit MRs. The child
 lookup is xa_load -> ib_umem_odp_alloc_child -> xa_cmpxchg(GFP_KERNEL);
-a racing insertion drops the loser's child. rxe_odp_chunk_len_at()
-reports how many bytes of an access can be served by one umem; for
-explicit MRs that is the full request, for implicit it is the bytes
-remaining in the current chunk. rxe_odp_mr_copy() loops across chunks,
-resolving + locking + copying + unlocking each child independently.
-Explicit MRs run the loop exactly once and see identical behavior to
-the pre-patch path.
+a racing insertion drops the loser. rxe_odp_chunk_len_at() reports how
+many bytes of an access can be served by one umem; for explicit MRs
+that is the full request, for implicit it is the bytes remaining in
+the current chunk. rxe_odp_mr_copy() loops across chunks, resolving,
+locking, copying, and unlocking each child independently. Explicit
+MRs run the loop exactly once with identical behavior to the pre-patch
+path.
 
-Multiple disjoint ranges on the same implicit MR are kept as distinct
-children in the xarray and coexist without thrashing.
-
-Prefetch. rxe_odp_prefetch_one() uses the same chunk loop so an
-implicit MR can be prefetched. Async prefetch walks per chunk under
-short-held mutexes so a long range does not stall concurrent
-invalidators.
+Prefetch. rxe_odp_prefetch_one() uses the same chunk loop. Async
+prefetch walks per chunk under short-held mutexes so a long range
+does not stall concurrent invalidators.
 
 Atomic, flush, and atomic-write paths reject implicit MRs at the top
 of each helper. These walk mr->umem->pfn_list directly which is empty
-for an implicit parent; extending them is not in scope and rejecting
-keeps the public claim aligned with what is verified.
+for an implicit parent; extending them is not in this series.
 
 Lifetime. rxe_mr_cleanup walks mr->implicit_children with xa_for_each
-and ib_umem_odp_release()s each child before ib_umem_release() on the
-parent, so each child's mmu_interval_notifier tears down while the
-parent's per_mm is still alive. The xarray is xa_destroy()ed
-afterwards.
+and releases each child via ib_umem_odp_release() before releasing
+the parent via ib_umem_release(), so each child's
+mmu_interval_notifier tears down while the parent's per_mm is alive.
+The xarray is xa_destroy()ed afterwards.
 
 The general_caps advertisement is extended with IB_ODP_SUPPORT_IMPLICIT
 so userspace can probe support via ibv_query_device. Per-transport
-caps are unchanged: they describe RC/UD behavior on explicit ODP MRs
-and remain accurate for that path.
+caps are unchanged: they describe RC/UD behavior on explicit ODP MRs.
+Whether IB_ODP_SUPPORT_IMPLICIT is the correct capability bit for a
+local-access-only operation matrix is an open question for review.
 
 Limitations. The xarray grows monotonically per MR: a child is not
-reclaimed until MR destroy. Long-lived MRs that touch a sparse
-address space would accumulate children. A reclaim mechanism is the
-natural next chunk of work.
+reclaimed until MR destroy. Long-lived MRs that touch a sparse address
+space accumulate children. A reclaim mechanism is the natural follow-up.
 
-Verified on Linux 6.17 (arm64, Soft-RoCE over loopback):
+Tested on Linux 6.17 (arm64, Soft-RoCE over loopback):
 - five-case registration accept/reject matrix passes
 - single-chunk 64 KiB RDMA WRITE through an implicit lkey delivers
 - two-chunk multi test (two 1 MiB WRITEs from buffers in different
-  2 MiB chunks of one implicit MR) delivers, exercising the xarray
+  2 MiB chunks of one implicit MR) delivers
 - cross-chunk single-SGE test (128 KiB WRITE spanning a 2 MiB
-  boundary) delivers, exercising the chunked copy loop
+  boundary) delivers
 
-This is a prototype, not an upstream submission. See CLAIMS.md in the
-companion rxe-implicit-odp repository for the exact scope boundary.
+Benchmark measures registration latency and RSS only; first-touch and
+steady-state data path costs are not characterized in this series.
 
 Signed-off-by: Liibaan Egal <liibaaneagle@gmail.com>
 ---
  drivers/infiniband/sw/rxe/rxe.c       |   6 +-
  drivers/infiniband/sw/rxe/rxe_mr.c    |  18 ++
  drivers/infiniband/sw/rxe/rxe_odp.c   | 283 ++++++++++++++++++++------
- drivers/infiniband/sw/rxe/rxe_verbs.h |  14 ++
- 4 files changed, 262 insertions(+), 59 deletions(-)
+ drivers/infiniband/sw/rxe/rxe_verbs.h |  16 ++
+ 4 files changed, 264 insertions(+), 59 deletions(-)
 
 diff --git a/drivers/infiniband/sw/rxe/rxe.c b/drivers/infiniband/sw/rxe/rxe.c
 index e891199..cf2628a 100644
@@ -641,17 +637,19 @@ index f58e3ec..f052be4 100644
  		i--;
  		rxe_put(work->frags[i].mr);
 diff --git a/drivers/infiniband/sw/rxe/rxe_verbs.h b/drivers/infiniband/sw/rxe/rxe_verbs.h
-index fd48075..1915985 100644
+index fd48075..0956138 100644
 --- a/drivers/infiniband/sw/rxe/rxe_verbs.h
 +++ b/drivers/infiniband/sw/rxe/rxe_verbs.h
-@@ -335,12 +335,26 @@ static inline int rkey_is_mw(u32 rkey)
+@@ -335,12 +335,28 @@ static inline int rkey_is_mw(u32 rkey)
  	return (index >= RXE_MIN_MW_INDEX) && (index <= RXE_MAX_MW_INDEX);
  }
  
 +/* For implicit ODP MRs the virtual address space is split into fixed-size
-+ * chunks and create one child umem per touched chunk on demand. 2 MiB
-+ * matches the typical THP size on aarch64 and x86_64, so a single child
-+ * can be backed by a huge page where one is available. */
++ * chunks. Each chunk is backed by at most one child umem allocated on
++ * first access. The 2 MiB chunk size keeps the child count bounded while
++ * limiting the amount of VA covered by each child. Whether the chunk
++ * size should be fixed, derived from page_shift, or configurable is an
++ * open design question for review. */
 +#define RXE_ODP_CHILD_SHIFT 21
 +#define RXE_ODP_CHILD_SIZE  (1UL << RXE_ODP_CHILD_SHIFT)
 +#define RXE_ODP_CHILD_MASK  (RXE_ODP_CHILD_SIZE - 1)
