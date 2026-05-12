@@ -1,6 +1,6 @@
-From c89aa9c24c0b014b07a8401966bc374416721cab Mon Sep 17 00:00:00 2001
-From: Liibaan Egal <liibaaneagle@gmail.com>
-Date: Tue, 12 May 2026 14:02:08 -0500
+From 74b19167dcaecc58d186c8775711c2676089a0c6 Mon Sep 17 00:00:00 2001
+From: Liibaan Egal <liibaegal@gmail.com>
+Date: Tue, 12 May 2026 14:20:24 -0500
 Subject: [RFC PATCH rdma-next 1/2] RDMA/rxe: add local implicit ODP MR support
 
 RXE already supports explicit ODP MRs. The implicit registration form
@@ -72,7 +72,7 @@ Tested on Linux 7.1-rc2 (arm64, Soft-RoCE over loopback):
 Benchmark measures registration latency and RSS only; first-touch and
 steady-state data path costs are not characterized in this series.
 
-Signed-off-by: Liibaan Egal <liibaaneagle@gmail.com>
+Signed-off-by: Liibaan Egal <liibaegal@gmail.com>
 ---
  drivers/infiniband/sw/rxe/rxe_mr.c    |  19 ++
  drivers/infiniband/sw/rxe/rxe_odp.c   | 288 +++++++++++++++++++++-----

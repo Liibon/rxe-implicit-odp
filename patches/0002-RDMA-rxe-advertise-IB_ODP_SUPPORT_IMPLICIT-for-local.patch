@@ -1,6 +1,6 @@
-From 3589099f65a73e2ad9c2f5c20d75f0eb3a4ea793 Mon Sep 17 00:00:00 2001
-From: Liibaan Egal <liibaaneagle@gmail.com>
-Date: Tue, 12 May 2026 14:02:08 -0500
+From 2bce1a35e2d6c225c6cf1843bc707090ca3dd9f1 Mon Sep 17 00:00:00 2001
+From: Liibaan Egal <liibaegal@gmail.com>
+Date: Tue, 12 May 2026 14:20:24 -0500
 Subject: [RFC PATCH rdma-next 2/2] RDMA/rxe: advertise IB_ODP_SUPPORT_IMPLICIT
  for local access
 
@@ -19,7 +19,7 @@ matrix, or should capability exposure wait for broader operation
 coverage? The cap-flip is kept in its own patch so the policy
 decision is separable from the implementation.
 
-Signed-off-by: Liibaan Egal <liibaaneagle@gmail.com>
+Signed-off-by: Liibaan Egal <liibaegal@gmail.com>
 ---
  drivers/infiniband/sw/rxe/rxe.c | 7 ++++++-
  1 file changed, 6 insertions(+), 1 deletion(-)
