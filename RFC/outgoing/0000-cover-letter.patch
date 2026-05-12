@@ -1,5 +1,5 @@
 From 2bce1a35e2d6c225c6cf1843bc707090ca3dd9f1 Mon Sep 17 00:00:00 2001
-From: Liibaan Egal <liibaaneagle@gmail.com>
+From: Liibaan Egal <liibaegal@gmail.com>
 Date: Tue, 12 May 2026 14:21:08 -0500
 Subject: [RFC PATCH rdma-next 0/2] RDMA/rxe: add local implicit ODP MR support
 
