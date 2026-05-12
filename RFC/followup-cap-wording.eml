@@ -1,0 +1,24 @@
+From: Liibaan Egal <liibaegal@gmail.com>
+To: linux-rdma@vger.kernel.org
+Cc: Zhu Yanjun <zyjzyj2000@gmail.com>,
+    Jason Gunthorpe <jgg@ziepe.ca>,
+    Leon Romanovsky <leon@kernel.org>,
+    linux-kernel@vger.kernel.org
+Subject: Re: [RFC PATCH rdma-next 1/2] RDMA/rxe: add local implicit ODP MR support
+In-Reply-To: <20260512201453.21156-2-liibaegal@gmail.com>
+References: <20260512201453.21156-1-liibaegal@gmail.com>
+ <20260512201453.21156-2-liibaegal@gmail.com>
+
+One clarification on the wording in the cover letter and patch 1/2
+commit message: when I said the per-transport ODP caps describe
+explicit ODP MR semantics, that was too strong. What I meant is that
+this series leaves the existing per-transport caps unchanged and
+implements only the local lkey implicit-MR access path, while
+rejecting remote rkey, atomic, flush, and atomic-write uses of
+implicit MRs.
+
+The intended review question remains whether advertising
+IB_ODP_SUPPORT_IMPLICIT is acceptable for that local-access-only
+implicit operation matrix, or whether the cap should wait for broader
+implicit coverage. I will reword this in a v2 if the series moves
+forward.
