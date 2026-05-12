@@ -18,8 +18,10 @@ out_path = sys.argv[2] if len(sys.argv) > 2 else "reg_latency.png"
 
 rows = []
 with open(csv_path) as f:
-    for r in csv.DictReader(f):
-        rows.append(r)
+    # Skip leading "#" comment lines (the bench writes a seed/config line).
+    lines = [ln for ln in f if not ln.startswith("#")]
+for r in csv.DictReader(lines):
+    rows.append(r)
 
 modes = sorted({r["mode"] for r in rows})
 

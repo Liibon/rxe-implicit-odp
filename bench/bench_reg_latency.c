@@ -132,8 +132,13 @@ static int cmp_u64(const void *a, const void *b)
 	return (x > y) - (x < y);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+	unsigned int seed = (unsigned)time(NULL);
+	for (int i = 1; i + 1 < argc; i++)
+		if (!strcmp(argv[i], "--seed"))
+			seed = (unsigned)strtoul(argv[i + 1], NULL, 0);
+
 	struct ibv_context *ctx = open_first();
 	if (!ctx) { fprintf(stderr, "no device\n"); return 77; }
 	struct ibv_pd *pd = ibv_alloc_pd(ctx);
@@ -152,7 +157,7 @@ int main(void)
 			for (int c = 0; c < N_CASES; c++) {
 				plan[p].c = c; plan[p].s = s; p++;
 			}
-	srand((unsigned)time(NULL));
+	srand(seed);
 	for (int i = n_plan - 1; i > 0; i--) {
 		int j = rand() % (i + 1);
 		__typeof__(plan[0]) t = plan[i]; plan[i] = plan[j]; plan[j] = t;
@@ -195,7 +200,10 @@ int main(void)
 		}
 	}
 
-	/* Emit aggregated CSV. */
+	/* Emit aggregated CSV. The seed line is a comment so naive readers
+	 * (csv module, awk) skip it without surfacing it in the data. */
+	printf("# bench_reg_latency seed=%u n_iters=%d n_cases=%d n_sizes=%d\n",
+		seed, N_ITERS, N_CASES, N_SIZES);
 	printf("mode,requested_size,actual_addr_arg,actual_length_arg,"
 	       "access_flags,median_ns,p95_ns,p99_ns,min_ns,max_ns,"
 	       "fail_count,errno,rss_before_kb,rss_after_kb\n");

@@ -7,32 +7,18 @@
  * Destination is a 4 MiB region with an explicit MR.
  */
 
-#include <errno.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
 #include <unistd.h>
 #include <sys/mman.h>
-#include <infiniband/verbs.h>
+#include "helpers.h"
 
-#define SRC_BYTES   (8 * 1024 * 1024)   /* spans multiple 2 MiB chunks */
-#define DST_BYTES   (4 * 1024 * 1024)
-#define XFER_BYTES  (1 * 1024 * 1024)
-#define OFFSET_A    (0)
-#define OFFSET_B    (4 * 1024 * 1024)   /* in a different 2 MiB chunk */
-#define MAGIC_A     0x11
-#define MAGIC_B     0x22
-
-static struct ibv_context *open_first(void)
-{
-	int n = 0;
-	struct ibv_device **list = ibv_get_device_list(&n);
-	if (!list || n == 0) return NULL;
-	struct ibv_context *ctx = ibv_open_device(list[0]);
-	ibv_free_device_list(list);
-	return ctx;
-}
+#define SRC_BYTES        (8 * 1024 * 1024)   /* spans multiple 2 MiB chunks */
+#define DST_BYTES        (4 * 1024 * 1024)
+#define XFER_BYTES       (1 * 1024 * 1024)
+#define OFFSET_A         (0)
+#define OFFSET_B         (4 * 1024 * 1024)   /* in a different 2 MiB chunk */
+#define MAGIC_A          0x11
+#define MAGIC_B          0x22
+#define POLL_TIMEOUT_MS  5000
 
 static int qp_to_rts(struct ibv_qp *qp, struct ibv_context *ctx,
 		     uint8_t port, uint32_t dest_qpn,
@@ -102,14 +88,15 @@ static int post_and_wait(struct ibv_qp *qp, struct ibv_cq *cq,
 	};
 	struct ibv_send_wr *bad = NULL;
 	struct ibv_wc wc;
-	int n;
 
 	if (ibv_post_send(qp, &wr, &bad)) {
 		perror("post_send");
 		return 1;
 	}
-	do { n = ibv_poll_cq(cq, 1, &wc); } while (n == 0);
-	if (n < 0 || wc.status != IBV_WC_SUCCESS) {
+	int r = odp_poll_cq_deadline(cq, &wc, POLL_TIMEOUT_MS, tag);
+	if (r == 0) return 1;
+	if (r < 0) { perror("poll_cq"); return 1; }
+	if (wc.status != IBV_WC_SUCCESS) {
 		fprintf(stderr, "[FAIL] %s: wc status=%d (%s)\n", tag,
 			wc.status, ibv_wc_status_str(wc.status));
 		return 1;
@@ -117,9 +104,9 @@ static int post_and_wait(struct ibv_qp *qp, struct ibv_cq *cq,
 	return 0;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
-	struct ibv_context *ctx = open_first();
+	struct ibv_context *ctx = odp_open_device(argc, argv);
 	if (!ctx) { fprintf(stderr, "no device\n"); return 77; }
 
 	struct ibv_port_attr port_attr;

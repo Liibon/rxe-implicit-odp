@@ -54,7 +54,32 @@ Base: `torvalds/linux` at tag `v6.17` (commit `e5f0a698b`).
 2. `sudo modprobe rdma_rxe`
 3. `sudo rdma link add rxe0 type rxe netdev <eth>`
 4. `make -C tests && make -C bench`
-5. `tests/implicit_odp_reg_test`
-6. `tests/implicit_odp_write_test`
-7. `tests/implicit_odp_multi_test`
-8. `bench/run.sh`
+5. `RXE_DEV=rxe0 tests/implicit_odp_reg_test`
+6. `RXE_DEV=rxe0 tests/implicit_odp_write_test`
+7. `RXE_DEV=rxe0 tests/implicit_odp_multi_test`
+8. `RXE_DEV=rxe0 tests/implicit_odp_cross_test`
+9. `bench/run.sh` (or `bench/bench_reg_latency --seed 42 > out.csv`)
+
+All tests and the bench accept `--dev rxe0` or `RXE_DEV=rxe0`.
+
+## Known limitations and next work
+
+The full scope boundary is in [CLAIMS.md](CLAIMS.md). The headline limits:
+
+- **No eviction.** Child umems are created on first access and stay until
+  MR destroy. Long-lived implicit MRs touching a sparse address space
+  accumulate children. A reclaim mechanism is the natural next chunk.
+- **No atomic / flush / atomic-write on implicit MRs.** Those helpers
+  walk the parent umem directly and would need the same child-resolution
+  wrapper used by the copy path. They return `-EOPNOTSUPP` /
+  `RESPST_ERR_RKEY_VIOLATION` on implicit today.
+- **No remote rkey on implicit MRs.** Remote-access bits are rejected at
+  registration time. Exposing implicit-shaped MRs to peers needs its own
+  threat-model discussion.
+- **Not an upstream submission yet.** This is a prototype patch series.
+  An RFC against `rdma/for-next` is the planned next step. See the patch
+  cover material in `patches/`.
+- **Registration-only bench.** The included benchmark intentionally
+  measures registration-time work. ODP shifts cost to first-touch / fault
+  paths; separate first-touch and steady-state benchmarks are needed to
+  fully characterize the tradeoff.

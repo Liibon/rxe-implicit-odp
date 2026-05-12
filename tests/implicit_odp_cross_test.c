@@ -1,29 +1,36 @@
-/* Local SGE write using an implicit ODP lkey on a loopback RXE pair.
- * Both QPs run on the same device so the test fits in a single VM. The
- * goal is to prove the lkey actually works in a real verbs operation,
- * not just that registration succeeded. Device selection via --dev /
- * RXE_DEV. CQ polls have a 5-second deadline to surface hangs rather
- * than spinning forever. */
+/* One RDMA WRITE whose single SGE straddles a 2 MiB chunk boundary on an
+ * implicit ODP MR. This is the sharp test for the chunk loop: a naive
+ * implementation that resolves only the first child would lose the
+ * second half of the transfer.
+ *
+ * Layout. A 4 MiB anonymous mapping covers two 2 MiB chunks (relative to
+ * the chunk grid that the kernel uses, RXE_ODP_CHILD_SIZE). I pick the
+ * SGE so it starts 64 KiB before a 2 MiB boundary and ends 64 KiB after.
+ * 128 KiB total, deliberately spanning two children. To make the
+ * boundary deterministic I align the buffer to 2 MiB first via
+ * posix_memalign.
+ *
+ * Device selection: --dev / RXE_DEV. */
 
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <sys/mman.h>
+
 #include "helpers.h"
 
-#define BUF_BYTES (64 * 1024)
-#define MAGIC     0xA5
-#define POLL_TIMEOUT_MS 5000
+#define CHUNK_SIZE       (2UL * 1024 * 1024)
+#define SRC_BYTES        (4 * 1024 * 1024)
+#define DST_BYTES        (256 * 1024)
+#define XFER_BYTES       (128 * 1024)
+#define LEAD_BYTES       (64 * 1024)   /* bytes before the boundary */
+#define MAGIC            0x5A
+#define POLL_TIMEOUT_MS  5000
 
-struct conn {
-	struct ibv_qp *qp;
-	uint32_t qpn;
-	uint16_t lid;
-	uint8_t  gid[16];
-};
-
-/* Bring a QP up to RTS for RC. I share the same path for both sides since
- * this is loopback. */
-static int qp_to_rts(struct ibv_qp *qp, struct ibv_context *ctx,
-		     uint8_t port, uint32_t dest_qpn,
+static int qp_to_rts(struct ibv_qp *qp, uint8_t port, uint32_t dest_qpn,
 		     uint16_t dlid, const uint8_t *dgid)
 {
 	struct ibv_qp_attr attr = {0};
@@ -84,24 +91,38 @@ int main(int argc, char **argv)
 	struct ibv_cq *scq = ibv_create_cq(ctx, 16, NULL, NULL, 0);
 	struct ibv_cq *rcq = ibv_create_cq(ctx, 16, NULL, NULL, 0);
 
-	/* Server side: explicit MR over a fixed buffer. I want a known rkey
-	 * to target with the RDMA WRITE coming from the client. */
-	void *dst = mmap(NULL, BUF_BYTES, PROT_READ|PROT_WRITE,
+	void *dst = mmap(NULL, DST_BYTES, PROT_READ|PROT_WRITE,
 			 MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-	memset(dst, 0, BUF_BYTES);
-	struct ibv_mr *dst_mr = ibv_reg_mr(pd, dst, BUF_BYTES,
+	memset(dst, 0, DST_BYTES);
+	struct ibv_mr *dst_mr = ibv_reg_mr(pd, dst, DST_BYTES,
 		IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
 	if (!dst_mr) { perror("reg_mr dst"); return 1; }
 
-	/* Client side: implicit ODP local lkey. The source buffer is plain
-	 * mmap memory the kernel must fault in on first SGE use. */
 	struct ibv_mr *src_mr = ibv_reg_mr(pd, NULL, SIZE_MAX,
 		IBV_ACCESS_ON_DEMAND | IBV_ACCESS_LOCAL_WRITE);
 	if (!src_mr) { perror("reg_mr implicit"); return 1; }
 
-	void *src = mmap(NULL, BUF_BYTES, PROT_READ|PROT_WRITE,
-			 MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-	memset(src, MAGIC, BUF_BYTES);
+	/* 2 MiB-aligned 4 MiB buffer. The buffer is split into two halves by
+	 * the chunk boundary at offset 2 MiB. The SGE starts 64 KiB into the
+	 * first half and runs 128 KiB total, so it crosses into the second
+	 * half. */
+	void *src_raw = NULL;
+	if (posix_memalign(&src_raw, CHUNK_SIZE, SRC_BYTES) != 0) {
+		perror("posix_memalign");
+		return 1;
+	}
+	memset(src_raw, MAGIC, SRC_BYTES);
+	uintptr_t src_base = (uintptr_t)src_raw;
+	uintptr_t sge_start = src_base + (CHUNK_SIZE - LEAD_BYTES);
+	uintptr_t sge_end   = sge_start + XFER_BYTES;
+	if ((sge_start >> 21) == (sge_end >> 21)) {
+		fprintf(stderr, "[FAIL] SGE does not span chunks: 0x%lx..0x%lx\n",
+			(unsigned long)sge_start, (unsigned long)sge_end);
+		return 1;
+	}
+	printf("SGE [0x%lx..0x%lx) crosses chunk boundary at 0x%lx\n",
+	       (unsigned long)sge_start, (unsigned long)sge_end,
+	       (unsigned long)(src_base + CHUNK_SIZE));
 
 	struct ibv_qp_init_attr qia = {
 		.send_cq = scq, .recv_cq = rcq,
@@ -113,12 +134,12 @@ int main(int argc, char **argv)
 	struct ibv_qp *qp_s = ibv_create_qp(pd, &qia);
 	if (!qp_c || !qp_s) { perror("create_qp"); return 1; }
 
-	if (qp_to_rts(qp_c, ctx, 1, qp_s->qp_num, port_attr.lid, gid.raw)) return 1;
-	if (qp_to_rts(qp_s, ctx, 1, qp_c->qp_num, port_attr.lid, gid.raw)) return 1;
+	if (qp_to_rts(qp_c, 1, qp_s->qp_num, port_attr.lid, gid.raw)) return 1;
+	if (qp_to_rts(qp_s, 1, qp_c->qp_num, port_attr.lid, gid.raw)) return 1;
 
 	struct ibv_sge sge = {
-		.addr = (uintptr_t)src,
-		.length = BUF_BYTES,
+		.addr = sge_start,
+		.length = XFER_BYTES,
 		.lkey = src_mr->lkey,
 	};
 	struct ibv_send_wr wr = {
@@ -134,8 +155,8 @@ int main(int argc, char **argv)
 
 	struct ibv_wc wc;
 	int r = odp_poll_cq_deadline(scq, &wc, POLL_TIMEOUT_MS,
-				     "RDMA WRITE via implicit lkey");
-	if (r == 0) return 1; /* timeout already logged */
+				     "cross-chunk RDMA WRITE");
+	if (r == 0) return 1;
 	if (r < 0) { perror("poll_cq"); return 1; }
 	if (wc.status != IBV_WC_SUCCESS) {
 		fprintf(stderr, "WC status=%d (%s)\n", wc.status,
@@ -144,13 +165,14 @@ int main(int argc, char **argv)
 	}
 
 	int bad_bytes = 0;
-	for (int i = 0; i < BUF_BYTES; i++)
+	for (int i = 0; i < XFER_BYTES; i++)
 		if (((unsigned char *)dst)[i] != MAGIC) bad_bytes++;
-
 	if (bad_bytes) {
-		fprintf(stderr, "[FAIL] %d/%d bytes wrong\n", bad_bytes, BUF_BYTES);
+		fprintf(stderr, "[FAIL] %d/%d bytes wrong\n", bad_bytes, XFER_BYTES);
 		return 1;
 	}
-	printf("[ OK ] implicit lkey RDMA WRITE delivered %d bytes\n", BUF_BYTES);
+	printf("[ OK ] single SGE crossing 2 MiB chunk boundary delivered %d bytes\n",
+	       XFER_BYTES);
+	free(src_raw);
 	return 0;
 }

@@ -1,0 +1,40 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  userspace:
+    name: compile tests + bench + lint plotter
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential libibverbs-dev python3 shellcheck
+
+      - name: build tests
+        run: make -C tests
+
+      - name: build bench
+        run: make -C bench
+
+      - name: lint plotter
+        run: python3 -m py_compile bench/plot_reg_latency.py
+
+      - name: shellcheck scripts
+        run: shellcheck bench/run.sh
+
+      - name: smoke-list binaries
+        run: |
+          file tests/implicit_odp_reg_test \
+               tests/implicit_odp_write_test \
+               tests/implicit_odp_multi_test \
+               tests/implicit_odp_cross_test \
+               bench/bench_reg_latency

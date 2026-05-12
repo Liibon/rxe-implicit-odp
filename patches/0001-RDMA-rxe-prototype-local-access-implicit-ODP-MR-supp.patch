@@ -1,4 +1,4 @@
-From bfbd7dec9ea5e77b6c98fe01b5a17e155333cb2e Mon Sep 17 00:00:00 2001
+From acf5cf600bcb09e6ba0fc2cea395e3054b7b2013 Mon Sep 17 00:00:00 2001
 From: Liibaan Egal <liibaaneagle@gmail.com>
 Date: Mon, 11 May 2026 14:20:43 -0500
 Subject: [PATCH] RDMA/rxe: prototype local-access implicit ODP MR support
@@ -69,39 +69,40 @@ Verified on Linux 6.17 (arm64, Soft-RoCE over loopback):
 - single-chunk 64 KiB RDMA WRITE through an implicit lkey delivers
 - two-chunk multi test (two 1 MiB WRITEs from buffers in different
   2 MiB chunks of one implicit MR) delivers, exercising the xarray
+- cross-chunk single-SGE test (128 KiB WRITE spanning a 2 MiB
+  boundary) delivers, exercising the chunked copy loop
 
 This is a prototype, not an upstream submission. See CLAIMS.md in the
 companion rxe-implicit-odp repository for the exact scope boundary.
 
 Signed-off-by: Liibaan Egal <liibaaneagle@gmail.com>
 ---
- drivers/infiniband/sw/rxe/rxe.c       |   7 +-
+ drivers/infiniband/sw/rxe/rxe.c       |   6 +-
  drivers/infiniband/sw/rxe/rxe_mr.c    |  18 ++
  drivers/infiniband/sw/rxe/rxe_odp.c   | 283 ++++++++++++++++++++------
  drivers/infiniband/sw/rxe/rxe_verbs.h |  14 ++
- 4 files changed, 263 insertions(+), 59 deletions(-)
+ 4 files changed, 262 insertions(+), 59 deletions(-)
 
 diff --git a/drivers/infiniband/sw/rxe/rxe.c b/drivers/infiniband/sw/rxe/rxe.c
-index e891199..a8107a1 100644
+index e891199..cf2628a 100644
 --- a/drivers/infiniband/sw/rxe/rxe.c
 +++ b/drivers/infiniband/sw/rxe/rxe.c
-@@ -92,8 +92,13 @@ static void rxe_init_device_param(struct rxe_dev *rxe, struct net_device *ndev)
+@@ -92,8 +92,12 @@ static void rxe_init_device_param(struct rxe_dev *rxe, struct net_device *ndev)
  	if (IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING)) {
  		rxe->attr.kernel_cap_flags |= IBK_ON_DEMAND_PAGING;
  
 -		/* IB_ODP_SUPPORT_IMPLICIT is not supported right now. */
  		rxe->attr.odp_caps.general_caps |= IB_ODP_SUPPORT;
-+		/* I advertise IMPLICIT here. The fault path in rxe_odp.c only
-+		 * supports local-access on implicit MRs, so I rely on the
-+		 * registration path to reject remote-access implicit forms.
-+		 * Per-transport caps below stay unchanged: those describe what
-+		 * works on explicit ODP MRs and remain accurate. */
++		/* IMPLICIT is gated to the local-access subset. The fault path
++		 * in rxe_odp.c rejects remote-access implicit forms at
++		 * registration time. Per-transport caps below stay unchanged:
++		 * they describe explicit ODP MR semantics and remain accurate. */
 +		rxe->attr.odp_caps.general_caps |= IB_ODP_SUPPORT_IMPLICIT;
  
  		rxe->attr.odp_caps.per_transport_caps.ud_odp_caps |= IB_ODP_SUPPORT_SEND;
  		rxe->attr.odp_caps.per_transport_caps.ud_odp_caps |= IB_ODP_SUPPORT_RECV;
 diff --git a/drivers/infiniband/sw/rxe/rxe_mr.c b/drivers/infiniband/sw/rxe/rxe_mr.c
-index bcb97b3..9ed1238 100644
+index bcb97b3..f32c2ea 100644
 --- a/drivers/infiniband/sw/rxe/rxe_mr.c
 +++ b/drivers/infiniband/sw/rxe/rxe_mr.c
 @@ -6,6 +6,8 @@
@@ -119,7 +120,7 @@ index bcb97b3..9ed1238 100644
  	rxe_put(mr_pd(mr));
 +
 +	/* Implicit ODP MRs may have created child umems on demand for each
-+	 * accessed 2 MiB chunk. I release them before the parent so each
++	 * accessed 2 MiB chunk. Release them before the parent so each
 +	 * child's mmu_interval_notifier tears down while the parent's
 +	 * per_mm is still alive. The xarray is empty for explicit MRs, so
 +	 * walking it is a no-op there. */
@@ -137,7 +138,7 @@ index bcb97b3..9ed1238 100644
  
  	if (mr->ibmr.type != IB_MR_TYPE_DMA)
 diff --git a/drivers/infiniband/sw/rxe/rxe_odp.c b/drivers/infiniband/sw/rxe/rxe_odp.c
-index f58e3ec..d371f35 100644
+index f58e3ec..f052be4 100644
 --- a/drivers/infiniband/sw/rxe/rxe_odp.c
 +++ b/drivers/infiniband/sw/rxe/rxe_odp.c
 @@ -5,6 +5,7 @@
@@ -181,7 +182,7 @@ index f58e3ec..d371f35 100644
  	int ret;
  
 -	ret = rxe_odp_do_pagefault_and_lock(mr, mr->umem->address,
-+	/* Explicit MR only: I snapshot the page table at registration. */
++	/* Explicit MR only: snapshot the page table at registration. */
 +	ret = rxe_odp_do_pagefault_and_lock(umem_odp, mr->umem->address,
  					    mr->umem->length,
  					    RXE_PAGEFAULT_SNAPSHOT);
@@ -193,7 +194,7 @@ index f58e3ec..d371f35 100644
 +/* Remote access on an implicit MR is intentionally out of scope. A
 + * remote rkey on a full-VA-shaped MR would let a peer drive faults
 + * against arbitrary process memory, and that surface needs separate
-+ * thinking. I reject up front. */
++ * thinking. Reject up front. */
 +#define RXE_REMOTE_ACCESS_MASK (IB_ACCESS_REMOTE_READ |	\
 +				IB_ACCESS_REMOTE_WRITE |	\
 +				IB_ACCESS_REMOTE_ATOMIC)
@@ -220,11 +221,11 @@ index f58e3ec..d371f35 100644
 +	mr->ibmr.iova = 0;
 +	mr->page_offset = 0;
 +
-+	/* I init the per-MR child xarray here so the cleanup path can
-+	 * unconditionally xa_destroy() without worrying about explicit MRs
-+	 * (those never touch this xarray, so it stays empty for them).
-+	 * The xarray uses GFP_NOWAIT on its internal nodes by default which
-+	 * is fine for our cmpxchg path with GFP_KERNEL passed in. */
++	/* Init the per-MR child xarray here so the cleanup path can
++	 * unconditionally xa_destroy() regardless of MR mode. Explicit MRs
++	 * never touch this xarray, so it stays empty for them. The xarray
++	 * allocator is invoked under GFP_KERNEL on the cmpxchg insertion
++	 * path below. */
 +	xa_init(&mr->implicit_children);
 +
 +	mr->state = RXE_MR_STATE_VALID;
@@ -276,8 +277,8 @@ index f58e3ec..d371f35 100644
 +		return ERR_PTR(xa_err(existing));
 +	}
 +	if (existing) {
-+		/* Another thread inserted while I was allocating. I drop
-+		 * my child and use theirs. */
++		/* Another thread inserted while this allocation was in
++		 * flight. Drop the loser and use the winner. */
 +		ib_umem_odp_release(child);
 +		return existing;
 +	}
@@ -432,7 +433,7 @@ index f58e3ec..d371f35 100644
 +
 +/* Atomic, flush, and atomic-write paths assume mr->umem itself holds the
 + * pfn_list. That is true for explicit MRs only. The implicit parent has
-+ * no pages of its own. I reject those operations on implicit MRs rather
++ * no pages of its own. Reject those operations on implicit MRs rather
 + * than extend them: remote access on implicit is already out of scope,
 + * so the only way these helpers could be reached is via a local atomic
 + * or flush, which the test matrix does not exercise. */
@@ -515,7 +516,7 @@ index f58e3ec..d371f35 100644
  };
  
 +/* Prefetch one SGE range. For implicit MRs the range may span multiple
-+ * chunks; I fault each chunk separately and drop the lock between them
++ * chunks; fault each chunk separately and drop the lock between them
 + * so concurrent invalidators are not blocked across the whole range. */
 +static int rxe_odp_prefetch_one(struct rxe_mr *mr, u64 io_virt, size_t length,
 +				u32 pf_flags)
@@ -640,14 +641,14 @@ index f58e3ec..d371f35 100644
  		i--;
  		rxe_put(work->frags[i].mr);
 diff --git a/drivers/infiniband/sw/rxe/rxe_verbs.h b/drivers/infiniband/sw/rxe/rxe_verbs.h
-index fd48075..d6b1e83 100644
+index fd48075..1915985 100644
 --- a/drivers/infiniband/sw/rxe/rxe_verbs.h
 +++ b/drivers/infiniband/sw/rxe/rxe_verbs.h
 @@ -335,12 +335,26 @@ static inline int rkey_is_mw(u32 rkey)
  	return (index >= RXE_MIN_MW_INDEX) && (index <= RXE_MAX_MW_INDEX);
  }
  
-+/* For implicit ODP MRs I split the virtual address space into fixed-size
++/* For implicit ODP MRs the virtual address space is split into fixed-size
 + * chunks and create one child umem per touched chunk on demand. 2 MiB
 + * matches the typical THP size on aarch64 and x86_64, so a single child
 + * can be backed by a huge page where one is available. */

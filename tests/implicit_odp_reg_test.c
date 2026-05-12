@@ -1,26 +1,8 @@
 /* Registration accept/reject behavior for local-access implicit ODP on RXE.
- * I run each case with a fresh PD so a prior failure cannot pollute state. */
+ * Each case uses a fresh PD so a prior failure cannot pollute state.
+ * Device selection: --dev NAME or RXE_DEV=NAME. */
 
-#include <errno.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
-#include <infiniband/verbs.h>
-
-static struct ibv_context *open_first(void)
-{
-	int n = 0;
-	struct ibv_device **list = ibv_get_device_list(&n);
-	if (!list || n == 0) {
-		fprintf(stderr, "no RDMA devices\n");
-		return NULL;
-	}
-	/* I pick the first device. In my VM that is the rxe device I add by name. */
-	struct ibv_context *ctx = ibv_open_device(list[0]);
-	ibv_free_device_list(list);
-	return ctx;
-}
+#include "helpers.h"
 
 struct case_t {
 	const char *name;
@@ -54,9 +36,9 @@ static int run_case(struct ibv_context *ctx, const struct case_t *c)
 	return 0;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
-	struct ibv_context *ctx = open_first();
+	struct ibv_context *ctx = odp_open_device(argc, argv);
 	if (!ctx) return 77; /* skip code */
 
 	/* Cases ordered from cheapest to most pathological. */
