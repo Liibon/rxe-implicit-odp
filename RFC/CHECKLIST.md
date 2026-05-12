@@ -1,84 +1,31 @@
-# Sending the RFC
+# Send RFC
 
-This file is the runbook for actually mailing the patch series. Run
-these steps on a machine where you have:
+Patches in `RFC/outgoing/`. checkpatch --strict: 0/0/0 on both.
 
-- git
-- git send-email (Debian/Ubuntu: `sudo apt-get install git-email`)
-- An SMTP account you can authenticate with
+## subscribe
+mail `linux-rdma+subscribe@vger.kernel.org` (subject/body blank, no confirm).
 
-The 2-patch series plus cover letter is in `RFC/outgoing/`:
-
-- `0000-cover-letter.patch`
-- `0001-RDMA-rxe-add-local-implicit-ODP-MR-support.patch`
-- `0002-RDMA-rxe-advertise-IB_ODP_SUPPORT_IMPLICIT-for-local.patch`
-
-Each runs clean through `scripts/checkpatch.pl --strict` (0 errors,
-0 warnings, 0 checks).
-
-## 1. Configure git send-email once
-
-Edit `~/.gitconfig`:
-
+## ~/.gitconfig
 ```
 [sendemail]
     smtpserver = smtp.gmail.com
     smtpserverport = 587
     smtpencryption = tls
-    smtpuser = liibaaneagle@gmail.com
+    smtpuser = liibaegal@gmail.com
+    from = Liibaan Egal <liibaegal@gmail.com>
     confirm = always
     suppresscc = self
     chainreplyto = false
 ```
+Gmail app password: https://myaccount.google.com/apppasswords. Let send-email prompt; do not store in .gitconfig.
 
-For Gmail, generate an app password at https://myaccount.google.com/apppasswords
-and use it for `smtppass` (or let send-email prompt every time, which
-is safer).
-
-## 2. Confirm the maintainers list
-
-From the kernel tree (`rdma/for-next` checkout):
-
+## dry run
 ```
-./scripts/get_maintainer.pl --nogit --nogit-fallback RFC/outgoing/*.patch
+git send-email --to liibaegal@gmail.com --suppress-cc=all RFC/outgoing/*.patch
 ```
+Check inbox: inline, unmangled, subjects `[RFC PATCH rdma-next 0/2]` etc.
 
-Expected (as of this preparation):
-
-- Zhu Yanjun <zyjzyj2000@gmail.com> (SOFT-ROCE / rxe maintainer)
-- Jason Gunthorpe <jgg@ziepe.ca> (InfiniBand subsystem maintainer)
-- Leon Romanovsky <leon@kernel.org> (InfiniBand subsystem maintainer)
-- linux-rdma@vger.kernel.org (RXE open list)
-- linux-kernel@vger.kernel.org (open list)
-
-## 3. Re-run checkpatch right before sending
-
-```
-./scripts/checkpatch.pl --strict RFC/outgoing/*.patch
-```
-
-Should report `0 errors, 0 warnings, 0 checks`. If anything new shows
-up, fix and re-export.
-
-## 4. Send a dry run to yourself first
-
-```
-git send-email \
-  --to liibaaneagle@gmail.com \
-  --suppress-cc=all \
-  RFC/outgoing/0000-*.patch RFC/outgoing/000[1-2]-*.patch
-```
-
-Open the result in your mail client. Check:
-
-- Subject line is `[RFC PATCH rdma-next 0/2] ...`
-- Numbered patches are `[RFC PATCH rdma-next 1/2] ...` and `2/2`
-- Patches are inline plain text (not attachments).
-- No mangled whitespace.
-- The cover letter renders.
-
-## 5. Send for real
-
+## send
 ```
 git send-email \
   --to linux-rdma@vger.kernel.org \
@@ -86,44 +33,26 @@ git send-email \
   --cc jgg@ziepe.ca \
   --cc leon@kernel.org \
   --cc linux-kernel@vger.kernel.org \
-  RFC/outgoing/0000-*.patch RFC/outgoing/000[1-2]-*.patch
+  RFC/outgoing/*.patch
+```
+Type `y` per recipient. Save the cover-letter Message-Id.
+
+## URL
+```
+MSGID=...  # from send output, no < >
+until curl -fsI "https://lore.kernel.org/linux-rdma/${MSGID}/" >/dev/null; do
+  sleep 60
+done
+echo "https://lore.kernel.org/linux-rdma/${MSGID}/"
+```
+Or search lore: https://lore.kernel.org/linux-rdma/?q=add+local+implicit+ODP
+
+## v2
+```
+git send-email --in-reply-to=<v1-cover-msgid> --subject-prefix="RFC PATCH v2 rdma-next" RFC/outgoing/*.patch
 ```
 
-git send-email will print each recipient and ask for confirmation
-because of `confirm = always`. Read the recipients and type `y` for
-each. Anything that looks wrong, type `n` and re-check.
-
-## 6. Track responses
-
-- Patchwork: https://patchwork.kernel.org/project/linux-rdma/list/
-  Search for the cover-letter subject.
-- lore archive: https://lore.kernel.org/linux-rdma/
-- Subscribe to linux-rdma so replies arrive in your inbox. vger
-  migrated off majordomo; the new system uses per-list +subscribe
-  addresses with no confirmation step:
-    To:      linux-rdma+subscribe@vger.kernel.org
-    Subject: (anything or blank)
-    Body:    (anything or blank)
-  Reference: https://subspace.kernel.org/subscribing.html
-
-## 7. Replying to feedback
-
-- Reply inline, plain text, top-quoting trimmed.
-- For a v2: rebase on current for-next, address feedback, run
-  checkpatch again, regenerate patches with `--subject-prefix="RFC PATCH
-  v2 rdma-next"`, send.
-- Use `--in-reply-to` with the Message-Id of your v1 cover letter so
-  Patchwork links the versions.
-
-## 8. Pitfalls to avoid
-
-- Do not send patches as attachments. Inline only.
-- Do not use webmail (Gmail web). It mangles whitespace and breaks
-  patches. Use git send-email.
-- Do not force-push the kernel branch after sending v1 without sending
-  a v2 announcement. Reviewers look at the patches you sent, not your
-  GitHub branch.
-- Do not announce hardware comparisons or performance claims you
-  cannot reproduce from this tree alone.
-- Do not respond defensively to maintainer feedback. They are doing
-  you a favor by reading.
+## don't
+- attachments (inline only)
+- Gmail web for patches (mangles whitespace)
+- force-push branch after v1 send without v2
